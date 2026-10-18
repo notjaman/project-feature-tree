@@ -111,6 +111,8 @@ Load a mod straight from this checkout, with hot reload on save, by adding its f
 
 Separate several mod folders with `:`. Don't also install the same mod from the marketplace, or it loads twice.
 
+Leave `version` out of a mod's `plugin.json`. Without it, each commit counts as a new version, so `claude plugin update` picks up every push. A fixed `version` that never gets bumped makes every update a no-op.
+
 Check a mod before committing:
 
 ```

@@ -1,6 +1,5 @@
 {
   "name": "project-feature-tree",
-  "version": "0.1.0",
   "description": "Pane showing the project's FEATURES.md as a module/feature tree, with model recommendations for next and missing features",
   "types": "./types/index.d.ts",
   "author": {
