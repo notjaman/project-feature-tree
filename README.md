@@ -7,13 +7,18 @@ Claude Code mods. This repository is a plugin marketplace, so each mod installs 
 Shows what a project has built as a tree in a Claude Code pane: the project at the top, its modules below, each module's features below those. Under the tree, a Recommendations section lists features that are missing and what to build next, judged from the tree.
 
 ```
-my-shop  3 done · 1 planned
-├─ Auth
-│  ├─ ✓ Email login
-│  └─ ○ Magic link
-└─ Billing
-   ├─ ✓ Stripe checkout
-   └─ ✓ Invoices
+Shop 2 done · 1 planned
+                           ┌──────┐
+                           │ Shop │
+                           └───┬──┘
+                 ┌─────────────┴─────────────┐
+             ┌───┴──┐                   ┌────┴────┐
+             │ Auth │                   │ Billing │
+             └───┬──┘                   └────┬────┘
+        ┌────────┴────────┐                  │
+┌───────┴───────┐ ┌───────┴──────┐ ┌─────────┴─────────┐
+│ ✓ Email login │ │ ○ Magic link │ │ ✓ Stripe checkout │
+└───────────────┘ └──────────────┘ └───────────────────┘
 
 Recommendations
 ## Missing
@@ -48,15 +53,16 @@ If the repository is private, the install only works for people who can read it 
 | Command | What it does |
 |---|---|
 | `/feature-tree` | Re-reads `FEATURES.md` and opens the pane |
-| `/feature-tree scan` | Queues a prompt asking Claude to scan the codebase and write `FEATURES.md`, or update it if it exists |
+| `/feature-tree scan` | Runs a background subagent that scans the codebase and writes `FEATURES.md`, or updates it if it exists. Nothing is posted in your conversation |
 | `/feature-tree analyze` | Sends the tree to Claude Opus 5.5 and shows the recommendations under the tree |
 
-First time in a project: run `/feature-tree scan`, let Claude finish, then `/feature-tree analyze`.
+First time in a project: run `/feature-tree scan`, wait for the `FEATURES.md updated` toast, then `/feature-tree analyze`.
 
 How it behaves:
 
 - **The tree lives in `FEATURES.md`** at the project root (the folder Claude Code was started in). It is plain Markdown, so you can edit it by hand and commit it.
 - **The pane opens by itself** at session start in projects that already have `FEATURES.md`. On narrow terminals it waits until the window is at least 144 columns wide; `/feature-tree` opens it at any width.
+- **The tree is a top-down chart**, each module's branch in its own color and planned features dimmed. Labels longer than 18 characters are cut. When the chart is wider than the pane, the pane shows an indented list instead and says how many columns the chart needs.
 - **The tree refreshes** after every Claude turn and on every `/feature-tree`.
 - **Claude keeps it current.** While `FEATURES.md` exists, Claude is told to tick or add features in it as it finishes them.
 - **Rescanning is safe.** `/feature-tree scan` on an existing file keeps your wording and your planned items; it only adds new features and ticks finished ones.

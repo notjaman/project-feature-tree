@@ -12,6 +12,8 @@ const REC_MODEL = 'claude-opus-5-5'
 
 const tree = atom({ plugin: 'project-feature-tree', key: 'tree' } as const, null)
 const busy = atom({ plugin: 'project-feature-tree', key: 'busy' } as const, false)
+// id of the background scan agent while it runs
+const scanning = atom({ plugin: 'project-feature-tree', key: 'scanning' } as const, null)
 
 const SCAN_PROMPT = `Scan this project's codebase and record its modules and features in ${FILE} at the project root.
 
@@ -73,6 +75,84 @@ function rows(nodes: Node[], prefix = ''): { glyphs: string; node: Node }[] {
   })
 }
 
+export type Seg = { text: string; color?: string; dim: boolean }
+
+// theme keys, so each module's color follows the person's light/dark theme
+const PALETTE = ['claude', 'suggestion', 'success', 'warning', 'permission', 'ide']
+// ponytail: labels cut to keep boxes narrow; wrap them inside the box if names get cut too often
+const MAX_LABEL = 18
+const GAP = 1
+// box-drawing joint by which sides it connects: up, down, left, right
+const JOINTS: Record<string, string> = {
+  '1100': '│', '0011': '─', '1011': '┴', '0111': '┬', '1111': '┼', '0101': '┌',
+  '0110': '┐', '1001': '└', '1010': '┘', '1101': '├', '1110': '┤',
+}
+
+// Top-down org chart: each node a 3-row box, a 1-row bus joining a box to its children.
+export function chart(title: string, nodes: Node[]) {
+  const label = (n: Node) => {
+    const chars = [...(n.children.length ? '' : n.done ? '✓ ' : '○ ') + n.text]
+    return chars.length > MAX_LABEL ? [...chars.slice(0, MAX_LABEL - 1), '…'] : chars
+  }
+  const span = (n: Node): number =>
+    Math.max(label(n).length + 4, n.children.reduce((s, c) => s + span(c), 0) + GAP * (n.children.length - 1))
+  const root: Node = { text: title, done: true, children: nodes }
+  const width = span(root)
+  const cells: { ch: string; color?: string; dim: boolean }[][] = []
+  const put = (x: number, y: number, ch: string, color: string | undefined, dim = false) => {
+    while (cells.length <= y) cells.push(Array.from({ length: width }, () => ({ ch: ' ', dim: false })))
+    cells[y]![x] = { ch, color, dim }
+  }
+
+  // draws n's subtree into columns [x, x + span(n)) from row y; returns the box's center column
+  const draw = (n: Node, x: number, y: number, color: string | undefined, hasParent: boolean): number => {
+    const total = n.children.reduce((s, c) => s + span(c), 0) + GAP * (n.children.length - 1)
+    let childX = x + Math.floor((span(n) - total) / 2)
+    const centers = n.children.map((c, i) => {
+      const center = draw(c, childX, y + 4, color ?? PALETTE[i % PALETTE.length], true)
+      childX += span(c) + GAP
+      return center
+    })
+
+    // box sits midway over its first and last child, kept inside its own columns
+    const text = label(n)
+    const w = text.length + 4
+    const mid = centers.length ? Math.floor((centers[0]! + centers[centers.length - 1]!) / 2) : x + Math.floor(span(n) / 2)
+    const bx = Math.min(Math.max(mid - Math.floor(w / 2), x), x + span(n) - w)
+    const cx = bx + Math.floor(w / 2)
+    const dim = !n.children.length && !n.done
+    const edge = (row: number, l: string, r: string, joint: string | false) => {
+      for (let i = 0; i < w; i++) put(bx + i, row, i === 0 ? l : i === w - 1 ? r : '─', color, dim)
+      if (joint) put(cx, row, joint, color, dim)
+    }
+    edge(y, '┌', '┐', hasParent && '┴')
+    ;['│', ' ', ...text, ' ', '│'].forEach((ch, i) => put(bx + i, y + 1, ch, color, dim))
+    edge(y + 2, '└', '┘', n.children.length > 0 && '┬')
+    if (!n.children.length) return cx
+
+    const lo = Math.min(cx, ...centers)
+    const hi = Math.max(cx, ...centers)
+    for (let col = lo; col <= hi; col++) {
+      const sides = [col === cx, centers.includes(col), col > lo, col < hi]
+      put(col, y + 3, JOINTS[sides.map(Number).join('')] ?? '─', color)
+    }
+    return cx
+  }
+  draw(root, 0, 0, undefined, false)
+
+  // runs of same-styled cells become one Seg
+  const rows = cells.map(row =>
+    row.reduce<Seg[]>((segs, c) => {
+      const last = segs[segs.length - 1]
+      if (last && last.color === c.color && last.dim === c.dim) last.text += c.ch
+      else segs.push({ text: c.ch, color: c.color, dim: c.dim })
+      return segs
+    }, []),
+  )
+
+  return { width, rows }
+}
+
 const leaves = (nodes: Node[]): Node[] =>
   nodes.flatMap(n => (n.children.length ? leaves(n.children) : [n]))
 
@@ -124,9 +204,16 @@ export const register: Register = on => {
   on('command.run', { command: 'feature-tree' }, async ($, e) => {
     const sub = e.args.trim()
     if (sub === 'scan') {
-      // deferred: the host refuses a submit from command.run, its turn would wait on this command
-      $.clock.after(0, () => void $.prompt.submit({ text: SCAN_PROMPT }))
-      return { text: 'Feature scan queued.' }
+      // a subagent, not $.prompt.submit: runs in the background, no prompt shown, main context untouched
+      const run = await $.agent.spawn({
+        prompt: SCAN_PROMPT,
+        description: `Scan features into ${FILE}`,
+        subagentType: 'general-purpose',
+      })
+      if (run.deny) return { text: `Feature scan refused: ${run.deny}` }
+      await update($, scanning, () => run.agentId ?? null)
+      await $.ui.open({ id: PANE, title: TITLE })
+      return { text: 'Feature scan running in the background.' }
     }
     if (sub !== '' && sub !== 'analyze') return { text: USAGE }
     const text = await load($)
@@ -141,6 +228,10 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     await load($)
+    if (e.agentId && e.agentId === (await read($, scanning))) {
+      await update($, scanning, () => null)
+      $.ui.toast(`${FILE} updated`)
+    }
 
     return done
   })
@@ -156,9 +247,11 @@ export const register: Register = on => {
     const { Box, Text, Markdown } = $.ui.resolve(e)
     const text = await read($, tree)
     const isBusy = await read($, busy)
+    const isScanning = (await read($, scanning)) !== null
     const cwd = await $.session.cwd()
     const recs = (await $.store.get(recsKey(cwd))) as Recs | undefined
     const { title, nodes } = parseTree(text ?? '', cwd.split('/').filter(Boolean).pop() ?? 'project')
+    const view = chart(title, nodes)
     const features = leaves(nodes)
     const done = features.filter(f => f.done).length
 
@@ -167,24 +260,40 @@ export const register: Register = on => {
         <Text bold>
           {title} <Text dimColor>{done} done · {features.length - done} planned</Text>
         </Text>
-        {text === null && <Text dimColor>No {FILE} in this project yet. Run /feature-tree scan.</Text>}
+        {isScanning && <Text dimColor>Scanning the codebase in the background…</Text>}
+        {!isScanning && text === null && <Text dimColor>No {FILE} in this project yet. Run /feature-tree scan.</Text>}
         {text !== null && nodes.length === 0 && (
           <Text dimColor>{FILE} has no bullets yet. Run /feature-tree scan.</Text>
         )}
-        {rows(nodes).map(({ glyphs, node }) => (
-          <Text mono>
-            <Text dimColor>{glyphs}</Text>
-            {node.children.length ? (
-              <Text bold>{node.text}</Text>
-            ) : node.done ? (
-              <Text>
-                <Text color="success">✓</Text> {node.text}
+        {nodes.length > 0 && view.width <= e.props.bodyColumns
+          ? view.rows.map(segs => (
+              <Text mono>
+                {segs.map(s => (
+                  <Text {...(s.color ? { color: s.color } : {})} dimColor={s.dim}>
+                    {s.text}
+                  </Text>
+                ))}
               </Text>
-            ) : (
-              <Text dimColor>○ {node.text}</Text>
-            )}
+            ))
+          : rows(nodes).map(({ glyphs, node }) => (
+              <Text mono>
+                <Text dimColor>{glyphs}</Text>
+                {node.children.length ? (
+                  <Text bold>{node.text}</Text>
+                ) : node.done ? (
+                  <Text>
+                    <Text color="success">✓</Text> {node.text}
+                  </Text>
+                ) : (
+                  <Text dimColor>○ {node.text}</Text>
+                )}
+              </Text>
+            ))}
+        {nodes.length > 0 && view.width > e.props.bodyColumns && (
+          <Text dimColor>
+            Chart needs {view.width} columns, pane has {e.props.bodyColumns}. Widen the terminal to see it.
           </Text>
-        ))}
+        )}
         <Box flexDirection="column" marginTop={1}>
           <Text bold>Recommendations</Text>
           {isBusy && <Text dimColor>Analyzing…</Text>}

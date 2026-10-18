@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { parseTree } from './register'
+import { chart, parseTree } from './register'
 
 const MD = `# Shop
 - Auth
@@ -40,16 +40,29 @@ test('parseTree nests modules and features with status', () => {
   expect(parseTree('- A', 'dir').title).toBe('dir')
 })
 
-test('commands: open loads tree, analyze shows recs, scan queues prompt', async ($, on) => {
+test('chart lays the tree out top-down', () => {
+  const { width, rows } = chart('Shop', parseTree(MD, 'dir').nodes)
+  const lines = rows.map(r => r.map(s => s.text).join('').trimEnd())
+  expect(width).toBe(56)
+  expect(lines[1]).toBe(' '.repeat(27) + '│ Shop │')
+  expect(lines[3]).toBe(' '.repeat(17) + '┌' + '─'.repeat(13) + '┴' + '─'.repeat(13) + '┐')
+  expect(lines[9]).toBe('│ ✓ Email login │ │ ○ Magic link │ │ ✓ Stripe checkout │')
+  // each module's branch has its own color; planned features are dimmed
+  const magic = rows[9]?.find(s => s.text.includes('Magic'))
+  expect(magic?.color).toBe('claude')
+  expect(magic?.dim).toBe(true)
+  expect(rows[9]?.find(s => s.text.includes('Stripe'))?.color).toBe('suggestion')
+})
+
+test('commands: open loads tree, analyze shows recs, scan spawns background agent', async ($, on) => {
   mock.store(on)
-  const clock = mock.clock(on)
-  let submitted = ''
+  let spawned = ''
   on('session.cwd', () => ({ value: '/work/shop' }))
   on('fs.read', () => ({ value: MD }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('prompt.submit', ($, e) => {
-    submitted = e.text
-    return { text: e.text }
+  on('agent.spawn', ($, e) => {
+    spawned = e.prompt
+    return { model: 'test' }
   })
   on('model.complete', () => ({
     value: {
@@ -75,7 +88,8 @@ test('commands: open loads tree, analyze shows recs, scan queues prompt', async 
     await ui.unmount()
   }
 
-  await $.command.run(run('scan'))
-  await clock.advance(1)
-  expect(submitted).toMatch(/FEATURES\.md/)
+  // the kit answers no agentId (core sets it), so the "Scanning" row is not reachable here
+  const scan = await $.command.run(run('scan'))
+  expect(scan.text).toMatch(/background/)
+  expect(spawned).toMatch(/FEATURES\.md/)
 })
