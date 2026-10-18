@@ -1,0 +1,13 @@
+{
+  "name": "general-use-mods",
+  "owner": {
+    "name": "notjaman"
+  },
+  "plugins": [
+    {
+      "name": "project-feature-tree",
+      "source": "./project-feature-tree"
+    }
+  ],
+  "description": "General-use Claude Code mods"
+}
