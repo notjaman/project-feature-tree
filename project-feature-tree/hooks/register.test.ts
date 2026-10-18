@@ -40,18 +40,20 @@ test('parseTree nests modules and features with status', () => {
   expect(parseTree('- A', 'dir').title).toBe('dir')
 })
 
-test('chart lays the tree out top-down', () => {
-  const { width, rows } = chart('Shop', parseTree(MD, 'dir').nodes)
-  const lines = rows.map(r => r.map(s => s.text).join('').trimEnd())
-  expect(width).toBe(56)
-  expect(lines[1]).toBe(' '.repeat(27) + '│ Shop │')
-  expect(lines[3]).toBe(' '.repeat(17) + '┌' + '─'.repeat(13) + '┴' + '─'.repeat(13) + '┐')
-  expect(lines[9]).toBe('│ ✓ Email login │ │ ○ Magic link │ │ ✓ Stripe checkout │')
-  // each module's branch has its own color; planned features are dimmed
-  const magic = rows[9]?.find(s => s.text.includes('Magic'))
-  expect(magic?.color).toBe('claude')
-  expect(magic?.dim).toBe(true)
-  expect(rows[9]?.find(s => s.text.includes('Stripe'))?.color).toBe('suggestion')
+test('chart: module cards under the project, wrapping to the pane width', () => {
+  const { nodes } = parseTree(MD, 'dir')
+  const lines = (cols: number) => chart('Shop', nodes, cols).rows.map(r => r.map(s => s.text).join('').trimEnd())
+  const wide = lines(60)
+  expect(wide[1]).toBe(' '.repeat(10) + '│ Shop │')
+  expect(wide[3]).toBe('  ┌' + '─'.repeat(11) + '┴' + '─'.repeat(11) + '┐')
+  expect(wide[5]).toBe('│ Auth 1/2 │            │ Billing 1/1 │')
+  expect(wide[8]).toBe('  └─ ○ Magic link')
+  // too narrow for two cards side by side: Billing wraps under Auth
+  expect(lines(30)).toContain('│ Billing 1/1 │')
+  // each module has its own color; planned features are dimmed
+  const { rows } = chart('Shop', nodes, 60)
+  expect(rows[8]?.find(s => s.text.includes('Magic'))?.dim).toBe(true)
+  expect(rows[7]?.find(s => s.text.includes('└─'))?.color).toBe('suggestion')
 })
 
 test('commands: open loads tree, analyze shows recs, scan spawns background agent', async ($, on) => {

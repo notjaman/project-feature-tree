@@ -8,17 +8,15 @@ Shows what a project has built as a tree in a Claude Code pane: the project at t
 
 ```
 Shop 2 done · 1 planned
-                           ┌──────┐
-                           │ Shop │
-                           └───┬──┘
-                 ┌─────────────┴─────────────┐
-             ┌───┴──┐                   ┌────┴────┐
-             │ Auth │                   │ Billing │
-             └───┬──┘                   └────┬────┘
-        ┌────────┴────────┐                  │
-┌───────┴───────┐ ┌───────┴──────┐ ┌─────────┴─────────┐
-│ ✓ Email login │ │ ○ Magic link │ │ ✓ Stripe checkout │
-└───────────────┘ └──────────────┘ └───────────────────┘
+          ┌──────┐
+          │ Shop │
+          └───┬──┘
+  ┌───────────┴───────────┐
+┌─┴────────┐            ┌─┴───────────┐
+│ Auth 1/2 │            │ Billing 1/1 │
+└─┬────────┘            └─┬───────────┘
+  ├─ ✓ Email login        └─ ✓ Stripe checkout
+  └─ ○ Magic link
 
 Recommendations
 ## Missing
@@ -62,10 +60,11 @@ How it behaves:
 
 - **The tree lives in `FEATURES.md`** at the project root (the folder Claude Code was started in). It is plain Markdown, so you can edit it by hand and commit it.
 - **The pane opens by itself** at session start in projects that already have `FEATURES.md`. On narrow terminals it waits until the window is at least 144 columns wide; `/feature-tree` opens it at any width.
-- **The tree is a top-down chart**, each module's branch in its own color and planned features dimmed. Labels longer than 18 characters are cut. When the chart is wider than the pane, the pane shows an indented list instead and says how many columns the chart needs.
+- **The tree is a top-down chart**: the project box on top, a box per module with its done/total count, and the module's features stacked under it. Module cards wrap into more rows to fit the pane, so any size of project shows. Each module has its own color, planned features are dimmed, and labels too long for a card are cut with `…`.
 - **The tree refreshes** after every Claude turn and on every `/feature-tree`.
 - **Claude keeps it current.** While `FEATURES.md` exists, Claude is told to tick or add features in it as it finishes them.
-- **Rescanning is safe.** `/feature-tree scan` on an existing file keeps your wording and your planned items; it only adds new features and ticks finished ones.
+- **Names stay simple.** Features are written in 2-5 plain words, the way a user would say them, with no library names, routes or other technical detail.
+- **Rescanning is safe.** `/feature-tree scan` on an existing file keeps every module, feature and planned item. It adds new features, ticks finished ones and shortens any technical names.
 - **Recommendations are cached per project.** They survive restarts and are marked stale once the tree changes. Run `/feature-tree analyze` again for a fresh set. Each run is one Opus call.
 
 ### FEATURES.md format

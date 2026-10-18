@@ -23,13 +23,14 @@ Format, exactly:
   - [x] <feature that is built>
   - [ ] <feature that is stubbed, TODO or half-done>
 
-Modules are top-level bullets, features nested under them (2-space indent), one short line each.
-If ${FILE} already exists, update it in place: keep every existing line, its wording and every "[ ]" planned item; only add newly found modules/features and tick "[x]" what is now finished. Do not change anything else.`
+Name modules and features the way a user would describe them: plain words, 2-5 each, no library or framework names, routes, file paths, env vars or notes in brackets. Write "Post reactions", not "Post reactions via Supabase RPC (rate-limited)".
+Modules are top-level bullets, features nested under them (2-space indent).
+If ${FILE} already exists, update it in place: keep every module, feature and "[ ]" planned item; shorten any name that breaks the naming rule above without changing its meaning or its [x]/[ ] mark; add newly found modules/features and tick "[x]" what is now finished. Remove nothing.`
 
 const UPKEEP = {
   id: 'project-feature-tree:upkeep',
   scope: 'session',
-  text: `This project tracks its modules and features in ${FILE} (nested bullets, "- [x]" built, "- [ ]" planned). When you finish building a feature, tick it or add it under its module in ${FILE}.`,
+  text: `This project tracks its modules and features in ${FILE} (nested bullets, "- [x]" built, "- [ ]" planned). When you finish building a feature, tick it or add it under its module in ${FILE}, named in 2-5 plain words with no technical detail.`,
 } as const
 
 const REC_SYSTEM = `You review a software project's feature tree (modules with their features; [x] built, [ ] planned).
@@ -38,6 +39,7 @@ Reply in terse Markdown with two sections:
 Per module, features a module like it usually needs that the tree lacks.
 ## Next
 The 3-5 features to build next, ranked, one line each with a short why.
+Name features in plain words a user would use, no technical detail.
 Never suggest anything already in the tree, built or planned.`
 
 export type Node = { text: string; done: boolean; children: Node[] }
@@ -79,78 +81,98 @@ export type Seg = { text: string; color?: string; dim: boolean }
 
 // theme keys, so each module's color follows the person's light/dark theme
 const PALETTE = ['claude', 'suggestion', 'success', 'warning', 'permission', 'ide']
-// ponytail: labels cut to keep boxes narrow; wrap them inside the box if names get cut too often
-const MAX_LABEL = 18
-const GAP = 1
+// ponytail: cards are one width and labels are cut to it; wrap long labels if names get cut too often
+const CARD_MAX = 30
+const CARD_GAP = 2
 // box-drawing joint by which sides it connects: up, down, left, right
 const JOINTS: Record<string, string> = {
   '1100': '│', '0011': '─', '1011': '┴', '0111': '┬', '1111': '┼', '0101': '┌',
   '0110': '┐', '1001': '└', '1010': '┘', '1101': '├', '1110': '┤',
 }
 
-// Top-down org chart: each node a 3-row box, a 1-row bus joining a box to its children.
-export function chart(title: string, nodes: Node[]) {
-  const label = (n: Node) => {
-    const chars = [...(n.children.length ? '' : n.done ? '✓ ' : '○ ') + n.text]
-    return chars.length > MAX_LABEL ? [...chars.slice(0, MAX_LABEL - 1), '…'] : chars
-  }
-  const span = (n: Node): number =>
-    Math.max(label(n).length + 4, n.children.reduce((s, c) => s + span(c), 0) + GAP * (n.children.length - 1))
-  const root: Node = { text: title, done: true, children: nodes }
-  const width = span(root)
+const len = (s: string) => [...s].length
+const cut = (s: string, max: number) => (len(s) > max ? [...s].slice(0, Math.max(0, max - 1)).join('') + '…' : s)
+const mark = (n: Node) => (n.children.length ? '' : n.done ? '✓ ' : '○ ')
+
+// Org chart that fits `cols`: the project box on top, joined to a row of module boxes;
+// each module's features hang under it as a card, and cards wrap into more rows.
+export function chart(title: string, nodes: Node[], cols: number) {
+  const cards = nodes.map((m, i) => {
+    const feats = m.children.length ? leaves(m.children) : []
+    const name = feats.length ? `${m.text} ${feats.filter(f => f.done).length}/${feats.length}` : m.text
+    return { name, color: PALETTE[i % PALETTE.length]!, lines: rows(m.children) }
+  })
+  const need = Math.max(
+    ...cards.flatMap(c => [len(c.name) + 4, ...c.lines.map(l => 2 + len(l.glyphs) + len(mark(l.node) + l.node.text))]),
+  )
+  const cardW = Math.max(5, Math.min(need, CARD_MAX, cols))
+  const perRow = Math.max(1, Math.min(cards.length, Math.floor((cols + CARD_GAP) / (cardW + CARD_GAP))))
+  const width = perRow * cardW + (perRow - 1) * CARD_GAP
+
   const cells: { ch: string; color?: string; dim: boolean }[][] = []
-  const put = (x: number, y: number, ch: string, color: string | undefined, dim = false) => {
+  const put = (x: number, y: number, ch: string, color?: string, dim = false) => {
     while (cells.length <= y) cells.push(Array.from({ length: width }, () => ({ ch: ' ', dim: false })))
     cells[y]![x] = { ch, color, dim }
   }
-
-  // draws n's subtree into columns [x, x + span(n)) from row y; returns the box's center column
-  const draw = (n: Node, x: number, y: number, color: string | undefined, hasParent: boolean): number => {
-    const total = n.children.reduce((s, c) => s + span(c), 0) + GAP * (n.children.length - 1)
-    let childX = x + Math.floor((span(n) - total) / 2)
-    const centers = n.children.map((c, i) => {
-      const center = draw(c, childX, y + 4, color ?? PALETTE[i % PALETTE.length], true)
-      childX += span(c) + GAP
-      return center
-    })
-
-    // box sits midway over its first and last child, kept inside its own columns
-    const text = label(n)
-    const w = text.length + 4
-    const mid = centers.length ? Math.floor((centers[0]! + centers[centers.length - 1]!) / 2) : x + Math.floor(span(n) / 2)
-    const bx = Math.min(Math.max(mid - Math.floor(w / 2), x), x + span(n) - w)
-    const cx = bx + Math.floor(w / 2)
-    const dim = !n.children.length && !n.done
-    const edge = (row: number, l: string, r: string, joint: string | false) => {
-      for (let i = 0; i < w; i++) put(bx + i, row, i === 0 ? l : i === w - 1 ? r : '─', color, dim)
-      if (joint) put(cx, row, joint, color, dim)
-    }
-    edge(y, '┌', '┐', hasParent && '┴')
-    ;['│', ' ', ...text, ' ', '│'].forEach((ch, i) => put(bx + i, y + 1, ch, color, dim))
-    edge(y + 2, '└', '┘', n.children.length > 0 && '┬')
-    if (!n.children.length) return cx
-
-    const lo = Math.min(cx, ...centers)
-    const hi = Math.max(cx, ...centers)
-    for (let col = lo; col <= hi; col++) {
-      const sides = [col === cx, centers.includes(col), col > lo, col < hi]
-      put(col, y + 3, JOINTS[sides.map(Number).join('')] ?? '─', color)
-    }
-    return cx
+  const text = (x: number, y: number, s: string, color?: string, dim = false) =>
+    [...s].forEach((ch, i) => put(x + i, y, ch, color, dim))
+  // 3-row box at (x, y) with optional joints on its top and bottom edges
+  const box = (x: number, y: number, label: string, color?: string, up?: number, down?: number) => {
+    const w = len(label) + 4
+    text(x, y, '┌' + '─'.repeat(w - 2) + '┐', color)
+    text(x, y + 1, `│ ${label} │`, color)
+    text(x, y + 2, '└' + '─'.repeat(w - 2) + '┘', color)
+    if (up !== undefined) put(up, y, '┴', color)
+    if (down !== undefined) put(down, y + 2, '┬', color)
   }
-  draw(root, 0, 0, undefined, false)
+
+  // the first row's stems are what the project box joins
+  const stems = cards.slice(0, perRow).map((_, i) => i * (cardW + CARD_GAP) + 2)
+  const rootLabel = cut(title, width - 4)
+  const rootW = len(rootLabel) + 4
+  const mid = Math.floor((stems[0]! + stems[stems.length - 1]!) / 2)
+  const rootX = Math.min(Math.max(mid - Math.floor(rootW / 2), 0), width - rootW)
+  const rootC = rootX + Math.floor(rootW / 2)
+  box(rootX, 0, rootLabel, undefined, undefined, rootC)
+  const lo = Math.min(rootC, ...stems)
+  const hi = Math.max(rootC, ...stems)
+  for (let col = lo; col <= hi; col++) {
+    put(col, 3, JOINTS[[col === rootC, stems.includes(col), col > lo, col < hi].map(Number).join('')] ?? '─')
+  }
+
+  // ponytail: rows after the first are not joined back to the project box; draw a trunk if that reads wrong
+  let y = 4
+  for (let r = 0; r * perRow < cards.length; r++) {
+    const row = cards.slice(r * perRow, (r + 1) * perRow)
+    row.forEach((c, i) => {
+      const x = i * (cardW + CARD_GAP)
+      box(x, y, cut(c.name, cardW - 4), c.color, r === 0 ? x + 2 : undefined, c.lines.length ? x + 2 : undefined)
+      c.lines.forEach(({ glyphs, node }, j) => {
+        const ly = y + 3 + j
+        const room = cardW - 2 - len(glyphs)
+        text(x + 2, ly, glyphs, c.color)
+        if (node.children.length) text(x + 2 + len(glyphs), ly, cut(node.text, room))
+        else if (node.done) {
+          text(x + 2 + len(glyphs), ly, '✓', c.color)
+          text(x + 4 + len(glyphs), ly, cut(node.text, room - 2))
+        } else text(x + 2 + len(glyphs), ly, cut('○ ' + node.text, room), undefined, true)
+      })
+    })
+    y += 3 + Math.max(...row.map(c => c.lines.length)) + 1
+  }
 
   // runs of same-styled cells become one Seg
-  const rows = cells.map(row =>
-    row.reduce<Seg[]>((segs, c) => {
-      const last = segs[segs.length - 1]
-      if (last && last.color === c.color && last.dim === c.dim) last.text += c.ch
-      else segs.push({ text: c.ch, color: c.color, dim: c.dim })
-      return segs
-    }, []),
-  )
-
-  return { width, rows }
+  return {
+    width,
+    rows: cells.map(row =>
+      row.reduce<Seg[]>((segs, c) => {
+        const last = segs[segs.length - 1]
+        if (last && last.color === c.color && last.dim === c.dim) last.text += c.ch
+        else segs.push({ text: c.ch, color: c.color, dim: c.dim })
+        return segs
+      }, []),
+    ),
+  }
 }
 
 const leaves = (nodes: Node[]): Node[] =>
@@ -251,7 +273,6 @@ export const register: Register = on => {
     const cwd = await $.session.cwd()
     const recs = (await $.store.get(recsKey(cwd))) as Recs | undefined
     const { title, nodes } = parseTree(text ?? '', cwd.split('/').filter(Boolean).pop() ?? 'project')
-    const view = chart(title, nodes)
     const features = leaves(nodes)
     const done = features.filter(f => f.done).length
 
@@ -265,35 +286,16 @@ export const register: Register = on => {
         {text !== null && nodes.length === 0 && (
           <Text dimColor>{FILE} has no bullets yet. Run /feature-tree scan.</Text>
         )}
-        {nodes.length > 0 && view.width <= e.props.bodyColumns
-          ? view.rows.map(segs => (
-              <Text mono>
-                {segs.map(s => (
-                  <Text {...(s.color ? { color: s.color } : {})} dimColor={s.dim}>
-                    {s.text}
-                  </Text>
-                ))}
-              </Text>
-            ))
-          : rows(nodes).map(({ glyphs, node }) => (
-              <Text mono>
-                <Text dimColor>{glyphs}</Text>
-                {node.children.length ? (
-                  <Text bold>{node.text}</Text>
-                ) : node.done ? (
-                  <Text>
-                    <Text color="success">✓</Text> {node.text}
-                  </Text>
-                ) : (
-                  <Text dimColor>○ {node.text}</Text>
-                )}
-              </Text>
-            ))}
-        {nodes.length > 0 && view.width > e.props.bodyColumns && (
-          <Text dimColor>
-            Chart needs {view.width} columns, pane has {e.props.bodyColumns}. Widen the terminal to see it.
-          </Text>
-        )}
+        {nodes.length > 0 &&
+          chart(title, nodes, e.props.bodyColumns).rows.map(segs => (
+            <Text mono>
+              {segs.map(s => (
+                <Text {...(s.color ? { color: s.color } : {})} dimColor={s.dim}>
+                  {s.text}
+                </Text>
+              ))}
+            </Text>
+          ))}
         <Box flexDirection="column" marginTop={1}>
           <Text bold>Recommendations</Text>
           {isBusy && <Text dimColor>Analyzing…</Text>}
