@@ -97,6 +97,72 @@ claude plugin update project-feature-tree@general-use-mods
 
 Then run `/reload-plugins` in any open session.
 
+## plan-tracker
+
+Keeps a timeline of every plan Claude writes in plan mode, across all your projects, in a Claude Code pane. Each row shows when the plan was written, its title, the project and feature it works on, and its status. The whole row takes the status color: green ● done, yellow ○ pending, red ● cancelled.
+
+```
+Plans 2 done · 1 pending · 1 cancelled
+Date    Plan                            Module / feature         Status
+Oct 19  Magic link sign-in              shop · Passwordless lo…  ○ pending
+Oct 17  Stripe checkout webhook         shop · Payments          ● done
+Oct 12  Drop the legacy admin path      shop · Admin routing     ● cancelled
+Sep 21  Speed up product … (file gone)  blog · Image loading     ● done
+```
+
+### Install
+
+```
+/plugin install plan-tracker --marketplace notjaman/general-use-mods
+```
+
+From a shell: `claude plugin install plan-tracker --marketplace notjaman/general-use-mods`. In the desktop app, add it from **+**, **Plugins**, as above.
+
+### Usage
+
+| Command | What it does |
+|---|---|
+| `/plans` | Opens the pane and rescans |
+| `/plans done <name>` | Marks a plan done by hand. `pending` and `cancel` work the same way |
+| `/plans auto <name>` | Drops the hand-set status and goes back to the worked-out one |
+
+`<name>` is any part of the plan's filename or title. If it matches more than one plan, the command lists them.
+
+### How status is worked out
+
+Plan files hold no status. The mod reads Claude Code's session transcripts in `~/.claude/projects`, which log every plan Claude submits and your answer to it, and goes by your last answer:
+
+| Your last answer | Status |
+|---|---|
+| Approved, and a `git commit` ran afterwards in that session | done |
+| Approved, no commit yet | pending |
+| Rejected with feedback (you typed what to change) | pending, or done once a commit follows |
+| Rejected with no comment | cancelled |
+| Never submitted, or never answered | pending |
+
+A commit counts only when it ran as a command, succeeded, and came before the next plan was submitted in that session. A hand-set status always wins.
+
+How it behaves:
+
+- **All projects, newest first.** The date is when the plan was first written.
+- **Feature labels come from Claude Haiku 5.5**, which reads each plan once and names its feature in 2-4 words. Labels are cached and redone only when a plan file changes; a row shows `…` until its label arrives.
+- **History is kept.** Claude Code deletes plan files after 30 days (the `cleanupPeriodDays` setting). The mod keeps every row it has seen, tagged `(file gone)`, and recovers older deleted plans from transcripts that still log their submit.
+- **It refreshes** on `/plans` and after each Claude turn while the pane is open. A scan reads every transcript in the background, about 2 seconds for a few hundred MB.
+- **The pane opens only on `/plans`.**
+
+### Limits
+
+- macOS and Linux only: it needs `perl` and `printenv` on the PATH, which both ship with macOS and most Linux systems.
+- Status depends on Claude Code's wording for approving and rejecting a plan. If a release changes that wording, rows read pending until the mod is updated.
+- Done is a guess from commits. A plan that changes no code (research, a diagnosis) never gets one; mark it with `/plans done`.
+- The project is the name of the folder the session started in.
+
+### Updating
+
+```
+claude plugin update plan-tracker@general-use-mods
+```
+
 ## Development
 
 Load a mod straight from this checkout, with hot reload on save, by adding its folder to `~/.claude/settings.json` and restarting Claude Code once:

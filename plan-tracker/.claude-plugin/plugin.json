@@ -1,0 +1,6 @@
+{
+  "name": "plan-tracker",
+  "description": "Pane listing every plan file Claude wrote, newest first, with the feature it works on and whether it is done, pending or cancelled",
+  "types": "./types/index.d.ts",
+  "author": { "name": "notjaman" }
+}
