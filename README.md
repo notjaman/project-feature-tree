@@ -120,32 +120,27 @@ From a shell: `claude plugin install plan-tracker --marketplace notjaman/general
 
 ### Usage
 
-| Command | What it does |
-|---|---|
-| `/plans` | Opens the pane and rescans |
-| `/plans done <name>` | Marks a plan done by hand. `pending` and `cancel` work the same way |
-| `/plans auto <name>` | Drops the hand-set status and goes back to the worked-out one |
-
-`<name>` is any part of the plan's filename or title, among this project's plans. If it matches more than one plan, the command lists them.
+Run `/plans` to open the pane. There is nothing else to do: every status is worked out automatically.
 
 ### How status is worked out
 
-Plan files hold no status. The mod reads Claude Code's session transcripts in `~/.claude/projects`, which log every plan Claude submits and your answer to it, and goes by your last answer:
+Plan files hold no status. The mod reads Claude Code's session transcripts in `~/.claude/projects`, which log every plan Claude submits, your answer to it, and what Claude did after. It goes by your last answer:
 
-| Your last answer | Status |
-|---|---|
-| Approved, and a `git commit` ran afterwards in that session | done |
-| Approved, no commit yet | pending |
-| Rejected with feedback (you typed what to change) | pending, or done once a commit follows |
-| Rejected with no comment | cancelled |
-| Never submitted, or never answered | pending |
+| Your last answer | What happened after | Status |
+|---|---|---|
+| Approved, or rejected with feedback | Claude edited project files, or a `git commit` ran, in that session | done |
+| Approved, or rejected with feedback | A commit since then, from any session or by hand, touched a file the plan names | done |
+| Approved | Neither of those: Claude Haiku 5.5 reads the plan and the commits since and judges it | done or pending |
+| Rejected with feedback | Nothing for 7 days | cancelled, pending until then |
+| Rejected with no comment | | cancelled |
+| Never submitted, or never answered | Nothing for 7 days | cancelled, pending until then |
 
-A commit counts only when it ran as a command, succeeded, and came before the next plan was submitted in that session. A hand-set status always wins.
+Work counts only when it came before the next plan was submitted in that session. A commit counts only when it ran as a command and succeeded. Edits to Claude's own files under `~/.claude` don't count. "Files the plan names" are the paths written in backticks in the plan, like `src/app/page.tsx`. The Haiku verdict is cached and asked again only when a new commit lands in the repository; a plan that only investigates or answers a question counts as done once approved.
 
 How it behaves:
 
 - **This project only, newest first.** A plan belongs to the project when it was made in the folder Claude Code was started in, or a folder inside it. The date is when the plan was first written.
-- **Feature labels come from Claude Haiku 5.5**, which reads each plan once and names its feature in 2-4 words. Labels are cached and redone only when a plan file changes; a row shows `…` until its label arrives. Only the open project's plans are labelled.
+- **Feature labels also come from Claude Haiku 5.5**, which reads each plan once and names its feature in 2-4 words. Labels are cached and redone only when a plan file changes; a row shows `…` until its label arrives. Only the open project's plans are labelled.
 - **History is kept.** Claude Code deletes plan files after 30 days (the `cleanupPeriodDays` setting). The mod keeps every row it has seen, tagged `(file gone)`, and recovers older deleted plans from transcripts that still log their submit.
 - **It refreshes** on `/plans` and after each Claude turn while the pane is open. A scan reads every transcript in the background, about 2 seconds for a few hundred MB.
 - **The pane opens only on `/plans`.**
@@ -154,7 +149,8 @@ How it behaves:
 
 - macOS and Linux only: it needs `perl` and `printenv` on the PATH, which both ship with macOS and most Linux systems.
 - Status depends on Claude Code's wording for approving and rejecting a plan. If a release changes that wording, rows read pending until the mod is updated.
-- Done is a guess from commits. A plan that changes no code (research, a diagnosis) never gets one; mark it with `/plans done`.
+- Done is a guess from what happened after the answer. A plan Claude only started, then left half-built, still reads done once a file was edited.
+- A plan carried out in a later session, left uncommitted, and naming no files reads pending until the model sees commits for it.
 - Started from a subfolder, the pane shows only plans made in that subfolder or below it, not plans made at the project root.
 
 ### Updating

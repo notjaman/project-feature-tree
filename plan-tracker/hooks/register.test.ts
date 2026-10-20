@@ -1,11 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { derive, formatRow, inProject, match, merge, parseLine } from './register'
+import { derive, formatRow, inProject, merge, parseLine, pathsOf } from './register'
 import type { Plan } from './register'
 import type { Snap } from '../types'
 
 const DIR = '/home/u/.claude/plans/'
 const at = (min: number) => new Date(Date.UTC(2026, 9, 1, 0, min)).toISOString()
+// a day after the fixtures, and well past the 7-day idle window
+const SOON = Date.UTC(2026, 9, 2)
+const LATE = Date.UTC(2026, 9, 20)
 const use = (session: string, min: number, id: string, name: string, input: object, extra: object = {}) =>
   JSON.stringify({
     type: 'assistant',
@@ -25,6 +28,7 @@ const res = (session: string, min: number, id: string, content: string, isError 
 const submit = (s: string, min: number, id: string, file: string, extra: object = {}) =>
   use(s, min, id, 'ExitPlanMode', { plan: `# Plan: ${file} title\n\nbody`, planFilePath: DIR + file }, extra)
 const commit = (s: string, min: number, id: string) => use(s, min, id, 'Bash', { command: 'git add . && git commit -m x' })
+const edit = (s: string, min: number, id: string, path: string) => use(s, min, id, 'Edit', { file_path: path, old_string: 'a', new_string: 'b' })
 const ok = (s: string, min: number, id: string) => res(s, min, id, 'User has approved your plan. You can now start coding.')
 const REJECTED = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file)."
 const no = (s: string, min: number, id: string) => res(s, min, id, `${REJECTED} STOP what you are doing and wait.`, true)
@@ -34,28 +38,31 @@ const feedback = (s: string, min: number, id: string) =>
 const LINES = [
   // approved, then a commit: done
   submit('s1', 1, 'u1', 'a.md'), ok('s1', 2, 'u1'), commit('s1', 3, 'c1'),
-  // b approved but the commit lands after c is submitted in the same session: b pending, c done
+  // b approved, but the commit lands after c is submitted in the same session: b needs a check, c done
   submit('s1', 4, 'u2', 'b.md'), ok('s1', 5, 'u2'),
   submit('s1', 6, 'u3', 'c.md'), ok('s1', 7, 'u3'), commit('s1', 8, 'c2'),
   // rejected with feedback, then a commit: done
   submit('s2', 1, 'u4', 'd.md'), feedback('s2', 2, 'u4'), commit('s2', 3, 'c3'),
-  // rejected with feedback, nothing after: pending
+  // rejected with feedback, nothing after (commands that only mention a commit are not one): check
   submit('s3', 1, 'u5', 'e.md'), feedback('s3', 2, 'u5'),
-  // a command that only mentions a commit is not one
   use('s3', 3, 'c8', 'Bash', { command: "grep -c 'git commit' x.jsonl" }),
   use('s3', 4, 'c9', 'Bash', { command: 'python3 -c "if \\"git commit\\" in s: pass"' }),
   // plain reject: cancelled
   submit('s4', 1, 'u6', 'f.md'), no('s4', 2, 'u6'),
-  // rejected, then resubmitted and approved and committed: the last answer counts
+  // rejected, then resubmitted, approved and committed: the last answer counts
   submit('s5', 1, 'u7', 'g.md'), no('s5', 2, 'u7'), submit('s5', 3, 'u8', 'g.md'), ok('s5', 4, 'u8'), commit('s5', 5, 'c4'),
   // written, never submitted
   use('s6', 1, 'w1', 'Write', { file_path: DIR + 'h.md', content: '# h' }, { cwd: '/work/notes' }),
-  // commit before the approval does not count
+  // a commit before the approval does not count
   commit('s7', 1, 'c5'), submit('s7', 2, 'u9', 'i.md'), ok('s7', 3, 'u9'),
   // a failed commit does not count
   submit('s8', 1, 'u10', 'j.md'), ok('s8', 2, 'u10'), commit('s8', 3, 'c6'), res('s8', 4, 'c6', 'nothing to commit', true),
   // a tool_use_error answers nothing
   submit('s9', 1, 'u11', 'k.md'), res('s9', 2, 'u11', '<tool_use_error>You are not in plan mode</tool_use_error>', true),
+  // approved, then Claude edits a project file: done
+  submit('s12', 1, 'u15', 'm.md'), ok('s12', 2, 'u15'), edit('s12', 3, 'e1', '/work/shop/src/m.ts'),
+  // approved, then only Claude's own config is edited: check
+  submit('s13', 1, 'u16', 'n.md'), ok('s13', 2, 'u16'), edit('s13', 3, 'e2', '/home/u/.claude/settings.json'),
   // file deleted, submit still in a transcript: comes back as a gone row
   submit('s10', 1, 'u12', 'z.md'), ok('s10', 2, 'u12'), commit('s10', 3, 'c7'),
   // subagent and sidechain plans are skipped
@@ -63,16 +70,19 @@ const LINES = [
   'not json',
 ]
 
-const PLANS: Plan[] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'].map(n => ({
+const PLANS: Plan[] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'm', 'n'].map(n => ({
   file: `${n}.md`,
   title: `${n} title`,
+  // older than every fixture, so it never counts as recent activity
   mtimeMs: 5,
 }))
 
+const autos = (rows: Record<string, Snap>) =>
+  Object.fromEntries(Object.entries(rows).map(([f, s]) => [f.replace('.md', ''), s.auto]))
+
 test('derive: status rules', () => {
-  const out = derive(LINES.flatMap(parseLine), PLANS)
-  const auto = Object.fromEntries(Object.entries(out).map(([f, s]) => [f.replace('.md', ''), s.auto]))
-  expect(auto).toEqual({
+  const { rows, checks } = derive(LINES.flatMap(parseLine), PLANS, SOON)
+  expect(autos(rows)).toEqual({
     a: 'done',
     b: 'pending',
     c: 'done',
@@ -84,13 +94,33 @@ test('derive: status rules', () => {
     i: 'pending',
     j: 'pending',
     k: 'pending',
+    m: 'done',
+    n: 'pending',
     z: 'done',
   })
-  expect(out['a.md']?.project).toBe('shop')
-  expect(out['h.md']?.project).toBe('notes')
-  expect(out['a.md']?.ts).toBe(Date.parse(at(1)))
-  expect(out['z.md']).toEqual(expect.objectContaining({ gone: true, title: 'z.md title' }))
-  expect(out['a.md']?.gone).toBeUndefined()
+  // answered plans with no work in their session go on to git and the model
+  expect(Object.keys(checks).sort()).toEqual(['b.md', 'e.md', 'i.md', 'j.md', 'n.md'])
+  expect(checks['b.md']).toEqual({ since: Date.parse(at(5)), approved: true, last: Date.parse(at(5)) })
+  expect(checks['e.md']?.approved).toBe(false)
+  expect(rows['a.md']?.project).toBe('shop')
+  expect(rows['h.md']?.project).toBe('notes')
+  expect(rows['a.md']?.ts).toBe(Date.parse(at(1)))
+  expect(rows['z.md']).toEqual(expect.objectContaining({ gone: true, title: 'z.md title' }))
+  expect(rows['a.md']?.gone).toBeUndefined()
+})
+
+test('derive: never submitted or never answered goes idle into cancelled', () => {
+  const { rows } = derive(LINES.flatMap(parseLine), PLANS, LATE)
+  expect(rows['h.md']?.auto).toBe('cancelled')
+  expect(rows['k.md']?.auto).toBe('cancelled')
+  // a recent edit to the plan file keeps it pending
+  const fresh = PLANS.map(p => (p.file === 'h.md' ? { ...p, mtimeMs: LATE - 1000 } : p))
+  expect(derive(LINES.flatMap(parseLine), fresh, LATE).rows['h.md']?.auto).toBe('pending')
+})
+
+test('pathsOf: backticked file paths as git pathspecs', () => {
+  const md = 'Edit `src/app/page.tsx` and `README.md`, see `/work/shop/api/x.ts:12`; not `https://x.io/a`, `../up.ts`, `e.props.bodyColumns`, `--flag`, `~/.claude/x.md`'
+  expect(pathsOf(md, '/work/shop')).toEqual([':(literal)src/app/page.tsx', ':(glob)**/README.md', ':(literal)api/x.ts'])
 })
 
 test('merge: stored rows outlive their files, labels carry over', () => {
@@ -112,21 +142,13 @@ test('merge: stored rows outlive their files, labels carry over', () => {
 })
 
 test('formatRow: fixed columns, cut titles, gone tag', () => {
-  const row = { file: 'a.md', title: 'A very long plan title that will not fit', module: 'shop · Auth', ts: new Date(2026, 9, 19).getTime(), status: 'cancelled' as const, gone: false }
+  const row = { file: 'a.md', title: 'A very long plan title that will not fit', module: 'Auth', ts: new Date(2026, 9, 19).getTime(), status: 'cancelled' as const, gone: false }
   const line = (r: typeof row, cols: number) => formatRow(r, cols).map(s => s.text).join('')
   expect(line(row, 60)).toHaveLength(60)
-  expect(line(row, 60)).toMatch(/^Oct 19  A very long plan tit…  shop · Auth\s+● cancelled$/)
+  expect(line(row, 60)).toMatch(/^Oct 19  A very long plan tit…  Auth\s+● cancelled$/)
   const gone = formatRow({ ...row, gone: true }, 60)
   expect(gone.find(s => s.text === ' (file gone)')?.dim).toBe(true)
   expect(line({ ...row, status: 'done' as never }, 60)).toMatch(/● done$/)
-})
-
-test('match: exact filename first, then substring of name or title', () => {
-  const snap = { 'serene-crab.md': { title: 'Domain migration' }, 'crab-cake.md': { title: 'Other' } } as unknown as Record<string, Snap>
-  expect(match(snap, 'serene-crab')).toEqual(['serene-crab.md'])
-  expect(match(snap, 'crab')).toHaveLength(2)
-  expect(match(snap, 'DOMAIN')).toEqual(['serene-crab.md'])
-  expect(match(snap, 'nope')).toEqual([])
 })
 
 test('inProject: made in the session folder or one inside it', () => {
@@ -153,16 +175,29 @@ const PANE = {
   },
 } as const
 
-const run = (args: string) =>
-  ({ command: 'plans', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } }) as const
+const run = { command: 'plans', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } } as const
 
-test('/plans scans, draws status rows, overrides by hand', async ($, on) => {
+const USAGE = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+test('/plans scans, settles answered plans through git and the model, draws status rows', async ($, on) => {
   mock.store(on)
   on('session.cwd', () => ({ value: '/work/shop' }))
   let spawned: readonly string[] = []
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/u\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const gitCalls: string[][] = []
+  const asked: string[] = []
+  on('process.run', ($, e) => {
+    const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv[0] === 'printenv') return out('/home/u\n')
+    gitCalls.push([...e.argv])
+    // a later commit touched the file plan b names
+    if (e.argv.includes(':(literal)src/b.ts')) return out('feat: b\n')
+    return out(e.argv.includes('-n') ? 'chore: unrelated\n' : '')
+  })
   on('fs.list', () => ({ value: PLANS.map(p => ({ name: p.file, kind: 'file' as const, size: 1, mtimeMs: 5, isLink: false })) }))
-  on('fs.read', ($, e) => ({ value: `# Plan: ${e.path.split('/').pop()!.replace('.md', '')} plan\n\nbody` }))
+  on('fs.read', ($, e) => {
+    const n = e.path.split('/').pop()!.replace('.md', '')
+    return { value: `# Plan: ${n} plan\n\nbody${n === 'b' ? ' Touch `src/b.ts`.' : ''}` }
+  })
   on('process.spawn', async function* ($, e) {
     spawned = e.argv
     // split mid-line, as a pipe would
@@ -172,39 +207,35 @@ test('/plans scans, draws status rows, overrides by hand', async ($, on) => {
     return { value: { code: 0, signal: null } }
   })
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('model.complete', () => ({
-    value: {
-      isAnswered: true,
-      text: 'Login flow',
-      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-    },
-  }))
+  on('model.complete', ($, e) => {
+    const prompt = String(e.prompt)
+    if (!String(e.system).includes('carried out')) return { value: { isAnswered: true, text: 'Login flow', usage: USAGE } }
+    asked.push(prompt.match(/# Plan: (\w+) plan/)?.[1] ?? '?')
+    return { value: { isAnswered: true, text: prompt.includes('i plan') ? 'PENDING' : 'DONE', usage: USAGE } }
+  })
 
-  const opened = await $.command.run(run(''))
-  expect(opened.text).toMatch(/opened/)
+  expect((await $.command.run(run)).text).toMatch(/opened/)
   expect(spawned[0]).toBe('perl')
   expect(spawned[spawned.length - 1]).toBe('/home/u/.claude/projects')
+  // git runs in the plan's own folder, from when it was answered
+  expect(gitCalls[0]?.slice(0, 5)).toEqual(['git', '-C', '/work/shop', 'log', '--all'])
+  // b settled by git; e is feedback, so it never reaches the model
+  expect(asked.sort()).toEqual(['i', 'j', 'n'])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ text: /Plans · shop/ })).toBeDefined()
-    expect(await ui.find({ text: /5 done · 5 pending · 1 cancelled/ })).toBeDefined()
+    // done: a b c d g j m n z · pending: i · cancelled: e (idle feedback) f k (idle, no answer)
+    expect(await ui.find({ text: /9 done · 1 pending · 3 cancelled/ })).toBeDefined()
     expect(await ui.find({ text: /^a plan$/ })).toBeDefined()
     // h.md was made in /work/notes, another project
     expect(await ui.find({ text: /^h plan$/ })).toBeUndefined()
     expect(await ui.find({ text: /Login flow/ })).toBeDefined()
     expect(await ui.find({ text: /\(file gone\)/ })).toBeDefined()
-    expect(await ui.find({ text: /● cancelled/ })).toBeDefined()
     await ui.unmount()
   }
 
-  expect((await $.command.run(run('cancel a.md'))).text).toMatch(/a plan: cancelled/)
-  expect((await $.command.run(run('done nope'))).text).toMatch(/No plan matches/)
-  expect((await $.command.run(run('done h.md'))).text).toMatch(/No plan matches/)
-  expect((await $.command.run(run('wat'))).text).toMatch(/\/plans opens/)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ text: /4 done · 5 pending · 2 cancelled/ })).toBeDefined()
-  expect((await $.command.run(run('auto a'))).text).toMatch(/a plan: back to done/)
-  expect(await ui.find({ text: /5 done · 5 pending · 1 cancelled/ })).toBeDefined()
-  await ui.unmount()
+  // verdicts are cached until a new commit lands
+  await $.command.run(run)
+  expect(asked).toHaveLength(3)
 })

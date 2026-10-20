@@ -5,14 +5,16 @@ import type { Row, Snap, Status } from '../types'
 
 const PANE = 'plans'
 const TITLE = 'Plans'
-// ponytail: a const, not userConfig; make it an option if people want a different labeller
-const LABEL_MODEL = 'claude-haiku-5-5'
+// ponytail: a const, not userConfig; make it an option if people want a different model for labels and checks
+const MODEL = 'claude-haiku-5-5'
+// a plan with no answer, or feedback never acted on, that sits this long is cancelled
+const IDLE_MS = 7 * 24 * 60 * 60 * 1000
 
 const rows = atom({ plugin: 'plan-tracker', key: 'rows' } as const, null)
 const scanning = atom({ plugin: 'plan-tracker', key: 'scanning' } as const, false)
 
-// transcript lines worth parsing: plan submits and their answers, commits, failed tool calls, plan-file writes
-const PATTERN = String.raw`"name":"ExitPlanMode"|approved your plan|"is_error":true|git (-C [^ ]+ )?commit|\.claude/plans/`
+// transcript lines worth parsing: plan submits and their answers, commits, failed tool calls, file edits
+const PATTERN = String.raw`"name":"ExitPlanMode"|approved your plan|"is_error":true|git (-C [^ ]+ )?commit|\.claude/plans/|"name":"(Edit|Write|MultiEdit|NotebookEdit)"`
 // prints every line of every .jsonl under the folder that matches the pattern
 const FILTER = String.raw`my ($re, $dir) = @ARGV; $re = qr/$re/; find(sub { return unless /\.jsonl$/ && -f; open(my $f, "<", $_) or return; while (<$f>) { print if $_ =~ $re } }, $dir)`
 // a commit run as a command, not a script or grep that only mentions one
@@ -21,14 +23,19 @@ const PLAN_PATH = /\/\.claude\/plans\/([^/]+\.md)$/
 
 const LABEL_SYSTEM =
   'You name the module or feature a software plan works on. Reply with 2-4 plain words and nothing else: no project name, punctuation or quotes.'
+const CHECK_SYSTEM = 'You check whether an approved software plan has been carried out. Reply with one word: DONE or PENDING.'
 
 export type Ev =
   | { k: 'submit'; id: string; file: string; ts: number; cwd: string; session: string; title: string }
   | { k: 'result'; id: string; ts: number; isError: boolean; text: string }
   | { k: 'commit'; id: string; ts: number; session: string }
   | { k: 'write'; file: string; ts: number; cwd: string }
+  | { k: 'edit'; ts: number; session: string }
 
 export type Plan = { file: string; title: string; mtimeMs: number }
+
+// An answered plan whose session shows no work after the answer: settle() looks in git, then asks the model.
+export type Check = { since: number; approved: boolean; last: number }
 
 const len = (s: string) => [...s].length
 const cut = (s: string, max: number) => (len(s) > max ? [...s].slice(0, Math.max(0, max - 1)).join('') + '…' : s)
@@ -69,9 +76,12 @@ export function parseLine(line: string): Ev[] {
       return [{ k: 'submit', id: b.id, file, ts, cwd, session, title: titleOf(String(input.plan ?? ''), file) }]
     }
     if (b.name === 'Bash' && COMMIT.test(String(input.command ?? ''))) return [{ k: 'commit', id: b.id, ts, session }]
-    if (b.name === 'Write' || b.name === 'Edit') {
-      const file = PLAN_PATH.exec(String(input.file_path ?? ''))?.[1]
-      if (file && !file.includes('-agent-')) return [{ k: 'write', file, ts, cwd }]
+    if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(b.name)) {
+      const path = String(input.file_path ?? input.notebook_path ?? '')
+      const file = PLAN_PATH.exec(path)?.[1]
+      if (file) return file.includes('-agent-') ? [] : [{ k: 'write', file, ts, cwd }]
+      // Claude's own config and memory files are not project work
+      if (path && !path.includes('/.claude/')) return [{ k: 'edit', ts, session }]
     }
     return []
   })
@@ -89,33 +99,44 @@ function answerOf(r: Extract<Ev, { k: 'result' }> | undefined): Answer | undefin
 }
 
 // Status from the plan's last answered submit:
-// plain reject = cancelled; approved, or rejected with feedback, = done once a commit lands
-// in that session before the next plan is submitted there, pending until then.
-export function derive(evs: Ev[], plans: Plan[]): Record<string, Snap> {
+// - plain reject: cancelled
+// - approved, or rejected with feedback: done once Claude edits a file or a commit lands in that
+//   session before the next plan is submitted there; otherwise a Check for settle()
+// - never submitted or never answered: pending, cancelled after IDLE_MS with no activity
+export function derive(evs: Ev[], plans: Plan[], now = Date.now()) {
   const results = new Map<string, Extract<Ev, { k: 'result' }>>()
   const submits: Extract<Ev, { k: 'submit' }>[] = []
+  const work: { ts: number; session: string }[] = []
   const commits: Extract<Ev, { k: 'commit' }>[] = []
   const writes: Extract<Ev, { k: 'write' }>[] = []
   for (const e of evs) {
     if (e.k === 'result') results.set(e.id, e)
     else if (e.k === 'submit') submits.push(e)
     else if (e.k === 'commit') commits.push(e)
+    else if (e.k === 'edit') work.push(e)
     else writes.push(e)
   }
   submits.sort((a, b) => a.ts - b.ts)
-  const landed = commits.filter(c => results.get(c.id)?.isError !== true)
+  work.push(...commits.filter(c => results.get(c.id)?.isError !== true))
+  const checks: Record<string, Check> = {}
 
-  const statusOf = (file: string): Status => {
+  const statusOf = (file: string, mtimeMs: number): Status => {
     let last: { s: (typeof submits)[number]; a: Answer } | undefined
+    let active = mtimeMs
     for (const s of submits) {
-      const a = s.file === file ? answerOf(results.get(s.id)) : undefined
+      if (s.file !== file) continue
+      const a = answerOf(results.get(s.id))
+      active = Math.max(active, s.ts, a?.ts ?? 0)
       if (a) last = { s, a }
     }
-    if (!last) return 'pending'
+    for (const w of writes) if (w.file === file) active = Math.max(active, w.ts)
+    if (!last) return now - active > IDLE_MS ? 'cancelled' : 'pending'
     const { s, a } = last
     if (!a.approved && !a.feedback) return 'cancelled'
     const end = submits.find(o => o.session === s.session && o.ts > s.ts && o.file !== file)?.ts ?? Infinity
-    return landed.some(c => c.session === s.session && c.ts > a.ts && c.ts < end) ? 'done' : 'pending'
+    if (work.some(w => w.session === s.session && w.ts > a.ts && w.ts < end)) return 'done'
+    checks[file] = { since: a.ts, approved: a.approved, last: active }
+    return 'pending'
   }
 
   // plans whose file is gone but whose submit is still in a transcript come back as gone rows
@@ -131,13 +152,27 @@ export function derive(evs: Ev[], plans: Plan[]): Record<string, Snap> {
       project: first?.cwd ? base(first.cwd) : '—',
       ...(first?.cwd ? { cwd: first.cwd } : {}),
       ts: first?.ts ?? p.mtimeMs,
-      auto: statusOf(p.file),
+      auto: statusOf(p.file, p.mtimeMs),
       ...(submits.some(s => s.file === p.file) ? { seen: true } : {}),
       mtimeMs: p.mtimeMs,
       ...(p.gone ? { gone: true } : {}),
     }
   }
-  return out
+  return { rows: out, checks }
+}
+
+// File paths a plan names in backticks, as git pathspecs relative to its project.
+export function pathsOf(md: string, cwd = '') {
+  const out = new Set<string>()
+  for (const [, raw = ''] of md.matchAll(/`([^`\s]+)`/g)) {
+    let p = raw.replace(/:\d+(?::\d+)?$/, '').replace(/^\.\//, '')
+    if (cwd && p.startsWith(`${cwd}/`)) p = p.slice(cwd.length + 1)
+    if (/^[/~:-]|:\/\/|\.\./.test(p)) continue
+    // a bare file name may sit in any folder
+    if (p.includes('/')) out.add(`:(literal)${p}`)
+    else if (/^[\w.-]+\.[a-z]{1,5}$/i.test(p)) out.add(`:(glob)**/${p}`)
+  }
+  return [...out].slice(0, 40)
 }
 
 // Fresh rows win; stored rows missing from this scan stay, marked gone; labels carry over.
@@ -197,19 +232,6 @@ export function header(cols: number) {
   return pad('Date', DATE_W) + '  ' + pad('Plan', w.title) + '  ' + pad('Module / feature', w.module) + '  Status'
 }
 
-// Exact filename first, then a case-insensitive substring of filename or title.
-export function match(snap: Record<string, Snap>, name: string) {
-  const files = Object.keys(snap)
-  const exact = files.filter(f => f === name || f === `${name}.md`)
-  if (exact.length) return exact
-  const q = name.toLowerCase()
-  return files.filter(f => f.toLowerCase().includes(q) || snap[f]!.title.toLowerCase().includes(q))
-}
-
-const VERBS: Record<string, Status | null> = { done: 'done', pending: 'pending', cancel: 'cancelled', auto: null }
-const USAGE =
-  '/plans opens the pane · /plans done|pending|cancel <name> sets a status by hand · /plans auto <name> goes back to the derived status'
-
 let home: Promise<string> | undefined
 const plansDir = async ($: EngineInterface) => {
   home ??= $.process.run(['printenv', 'HOME']).then(r => r.stdout.trim())
@@ -224,7 +246,6 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 const getSnap = async ($: EngineInterface) => ((await $.store.get('rows')) ?? {}) as Record<string, Snap>
-const getOverrides = async ($: EngineInterface) => ((await $.store.get('overrides')) ?? {}) as Record<string, Status>
 
 // A plan is this project's when it was made in the session's folder or one inside it.
 // ponytail: a session started in a subfolder misses plans made at the root; match on git toplevel if that bites
@@ -241,14 +262,13 @@ async function projectSnap($: EngineInterface) {
 
 async function publish($: EngineInterface) {
   const snap = await projectSnap($)
-  const ov = await getOverrides($)
   const list: Row[] = Object.entries(snap)
     .map(([file, s]) => ({
       file,
       title: s.title,
       module: s.label ?? '…',
       ts: s.ts,
-      status: ov[file] ?? s.auto,
+      status: s.auto,
       gone: s.gone === true,
     }))
     .sort((a, b) => b.ts - a.ts)
@@ -285,17 +305,24 @@ async function scan($: EngineInterface) {
   try {
     const dir = await plansDir($)
     const entries = await $.fs.list(dir).catch(() => [])
+    const texts = new Map<string, string>()
     const plans = await Promise.all(
       entries
         .filter(e => e.kind === 'file' && e.name.endsWith('.md') && !e.name.includes('-agent-'))
-        .map(async e => ({
-          file: e.name,
-          mtimeMs: e.mtimeMs,
-          title: titleOf(await $.fs.read(`${dir}/${e.name}`).then(t => (typeof t === 'string' ? t : ''), () => ''), e.name),
-        })),
+        .map(async e => {
+          const text = await $.fs.read(`${dir}/${e.name}`).then(t => (typeof t === 'string' ? t : ''), () => '')
+          texts.set(e.name, text)
+          return { file: e.name, mtimeMs: e.mtimeMs, title: titleOf(text, e.name) }
+        }),
     )
     const evs = await readEvents($, dir.replace(/plans$/, 'projects'))
-    const fresh = derive(evs, plans)
+    const { rows: fresh, checks } = derive(evs, plans)
+    const old = await getSnap($)
+    const cwd = await $.session.cwd()
+    for (const [file, check] of Object.entries(checks)) {
+      const s = fresh[file]!
+      fresh[file] = await settle($, file, s, check, texts.get(file) ?? '', old[file], inProject(s, cwd))
+    }
     await serial(async () => $.store.set('rows', merge(await getSnap($), fresh)))
     await publish($)
   } finally {
@@ -305,10 +332,56 @@ async function scan($: EngineInterface) {
   void labelAll($)
 }
 
+const checkFailed = new Set<string>()
+
+// An answered plan with no work in its own session: a later commit touching the files it names
+// makes it done. Failing that, feedback goes idle into cancelled, and an approved plan is judged
+// by the model from its text and the commits since, cached until a new commit lands.
+// Only this project's plans reach the model; others keep their last verdict.
+async function settle($: EngineInterface, file: string, s: Snap, c: Check, text: string, old: Snap | undefined, mayAsk: boolean, now = Date.now()): Promise<Snap> {
+  if (!text) return old ? { ...s, auto: old.auto } : s
+  const log = async (args: string[]) => {
+    if (!s.cwd) return []
+    const since = `--since=${new Date(c.since).toISOString()}`
+    const r = await $.process.run(['git', '-C', s.cwd, 'log', '--all', since, '--format=%s', ...args]).catch(() => undefined)
+    return r?.exitCode === 0 ? r.stdout.split('\n').filter(Boolean) : []
+  }
+  const paths = pathsOf(text, s.cwd)
+  if (paths.length && (await log(['--', ...paths])).length) return { ...s, auto: 'done' }
+  if (!c.approved) return { ...s, auto: now - c.last > IDLE_MS ? 'cancelled' : 'pending' }
+  const subjects = await log(['-n', '30'])
+  const key = `${c.since}:${subjects.length}:${subjects[0] ?? ''}`
+  const verdict = (done: boolean): Snap => ({ ...s, auto: done ? 'done' : 'pending', checkKey: key, checkDone: done })
+  if (old?.checkKey === key && old.checkDone !== undefined) return verdict(old.checkDone)
+  if (!mayAsk || checkFailed.has(`${file}:${key}`)) return s
+  const done = await askDone($, text, subjects)
+  if (done === undefined) {
+    checkFailed.add(`${file}:${key}`)
+    return s
+  }
+  return verdict(done)
+}
+
+async function askDone($: EngineInterface, text: string, subjects: string[]) {
+  try {
+    const reply = await $.model.complete({
+      model: MODEL,
+      system: CHECK_SYSTEM,
+      prompt: `Plan:\n${text.slice(0, 4000)}\n\nCommits in its repository since it was approved, newest first:\n${subjects.join('\n') || '(none)'}\n\nA plan that only investigates, diagnoses or answers a question, with nothing to change, is DONE once approved. A plan that changes code or files is DONE only when the commits show that work.`,
+      maxTokens: 10,
+      timeoutMs: 30_000,
+    })
+    if (!reply.isAnswered) return undefined
+    return /^\W*done\b/i.test(reply.text)
+  } catch {
+    return undefined
+  }
+}
+
 async function askLabel($: EngineInterface, title: string, text: string) {
   try {
     const reply = await $.model.complete({
-      model: LABEL_MODEL,
+      model: MODEL,
       system: LABEL_SYSTEM,
       prompt: `${title}\n\n${text.slice(0, 3000)}`,
       maxTokens: 30,
@@ -360,34 +433,16 @@ export const register: Register = on => {
     await $.command.register({
       name: 'plans',
       description: "Timeline of this project's plan files, with their status",
-      argumentHint: '[done|pending|cancel|auto <name>]',
     })
     await publish($)
     return next(e)
   })
 
-  on('command.run', { command: 'plans' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
-    const name = rest.join(' ')
-    if (verb === '') {
-      isOpen = true
-      await $.ui.open({ id: PANE, title: TITLE })
-      await scan($)
-      return { text: 'Plans pane opened.' }
-    }
-    if (!(verb in VERBS) || !name) return { text: USAGE }
-    const status = VERBS[verb]!
-    const snap = await projectSnap($)
-    const hits = match(snap, name)
-    if (hits.length === 0) return { text: `No plan matches "${name}".` }
-    if (hits.length > 1) return { text: `"${name}" matches ${hits.length} plans: ${hits.slice(0, 8).join(', ')}` }
-    const file = hits[0]!
-    await serial(async () => {
-      const { [file]: _, ...ov } = await getOverrides($)
-      await $.store.set('overrides', status ? { ...ov, [file]: status } : ov)
-    })
-    await publish($)
-    return { text: `${snap[file]!.title}: ${status ?? `back to ${snap[file]!.auto}`}` }
+  on('command.run', { command: 'plans' }, async $ => {
+    isOpen = true
+    await $.ui.open({ id: PANE, title: TITLE })
+    await scan($)
+    return { text: 'Plans pane opened.' }
   })
 
   on('ui.close', async ($, e, next) => {

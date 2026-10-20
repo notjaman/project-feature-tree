@@ -17,6 +17,9 @@ export type Snap = {
   labelMtime?: number
   // a transcript still logs a submit of this plan
   seen?: boolean
+  // the model's done-or-not verdict, and what it was given (answer time and commits since)
+  checkKey?: string
+  checkDone?: boolean
 }
 
 declare module 'claude-code' {
