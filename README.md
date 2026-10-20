@@ -99,15 +99,15 @@ Then run `/reload-plugins` in any open session.
 
 ## plan-tracker
 
-Keeps a timeline of every plan Claude writes in plan mode, across all your projects, in a Claude Code pane. Each row shows when the plan was written, its title, the project and feature it works on, and its status. The whole row takes the status color: green ● done, yellow ○ pending, red ● cancelled.
+Keeps a timeline of the plans Claude writes in plan mode for the project you are working in, in a Claude Code pane. Each row shows when the plan was written, its title, the module or feature it works on, and its status. The whole row takes the status color: green ● done, yellow ○ pending, red ● cancelled.
 
 ```
-Plans 2 done · 1 pending · 1 cancelled
+Plans · shop 2 done · 1 pending · 1 cancelled
 Date    Plan                            Module / feature         Status
-Oct 19  Magic link sign-in              shop · Passwordless lo…  ○ pending
-Oct 17  Stripe checkout webhook         shop · Payments          ● done
-Oct 12  Drop the legacy admin path      shop · Admin routing     ● cancelled
-Sep 21  Speed up product … (file gone)  blog · Image loading     ● done
+Oct 19  Magic link sign-in              Passwordless login       ○ pending
+Oct 17  Stripe checkout webhook         Payments                 ● done
+Oct 12  Drop the legacy admin path      Admin routing            ● cancelled
+Sep 21  Speed up product … (file gone)  Image loading            ● done
 ```
 
 ### Install
@@ -126,7 +126,7 @@ From a shell: `claude plugin install plan-tracker --marketplace notjaman/general
 | `/plans done <name>` | Marks a plan done by hand. `pending` and `cancel` work the same way |
 | `/plans auto <name>` | Drops the hand-set status and goes back to the worked-out one |
 
-`<name>` is any part of the plan's filename or title. If it matches more than one plan, the command lists them.
+`<name>` is any part of the plan's filename or title, among this project's plans. If it matches more than one plan, the command lists them.
 
 ### How status is worked out
 
@@ -144,8 +144,8 @@ A commit counts only when it ran as a command, succeeded, and came before the ne
 
 How it behaves:
 
-- **All projects, newest first.** The date is when the plan was first written.
-- **Feature labels come from Claude Haiku 5.5**, which reads each plan once and names its feature in 2-4 words. Labels are cached and redone only when a plan file changes; a row shows `…` until its label arrives.
+- **This project only, newest first.** A plan belongs to the project when it was made in the folder Claude Code was started in, or a folder inside it. The date is when the plan was first written.
+- **Feature labels come from Claude Haiku 5.5**, which reads each plan once and names its feature in 2-4 words. Labels are cached and redone only when a plan file changes; a row shows `…` until its label arrives. Only the open project's plans are labelled.
 - **History is kept.** Claude Code deletes plan files after 30 days (the `cleanupPeriodDays` setting). The mod keeps every row it has seen, tagged `(file gone)`, and recovers older deleted plans from transcripts that still log their submit.
 - **It refreshes** on `/plans` and after each Claude turn while the pane is open. A scan reads every transcript in the background, about 2 seconds for a few hundred MB.
 - **The pane opens only on `/plans`.**
@@ -155,7 +155,7 @@ How it behaves:
 - macOS and Linux only: it needs `perl` and `printenv` on the PATH, which both ship with macOS and most Linux systems.
 - Status depends on Claude Code's wording for approving and rejecting a plan. If a release changes that wording, rows read pending until the mod is updated.
 - Done is a guess from commits. A plan that changes no code (research, a diagnosis) never gets one; mark it with `/plans done`.
-- The project is the name of the folder the session started in.
+- Started from a subfolder, the pane shows only plans made in that subfolder or below it, not plans made at the project root.
 
 ### Updating
 

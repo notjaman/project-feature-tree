@@ -7,6 +7,8 @@ export type Row = { file: string; title: string; module: string; ts: number; sta
 export type Snap = {
   title: string
   project: string
+  // folder the plan was made in; absent on rows stored before it was kept
+  cwd?: string
   ts: number
   auto: Status
   mtimeMs: number

@@ -129,6 +129,7 @@ export function derive(evs: Ev[], plans: Plan[]): Record<string, Snap> {
       title: p.title,
       // ponytail: project = cwd basename; git toplevel if sessions start in subdirs
       project: first?.cwd ? base(first.cwd) : '—',
+      ...(first?.cwd ? { cwd: first.cwd } : {}),
       ts: first?.ts ?? p.mtimeMs,
       auto: statusOf(p.file),
       ...(submits.some(s => s.file === p.file) ? { seen: true } : {}),
@@ -225,14 +226,27 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
 const getSnap = async ($: EngineInterface) => ((await $.store.get('rows')) ?? {}) as Record<string, Snap>
 const getOverrides = async ($: EngineInterface) => ((await $.store.get('overrides')) ?? {}) as Record<string, Status>
 
+// A plan is this project's when it was made in the session's folder or one inside it.
+// ponytail: a session started in a subfolder misses plans made at the root; match on git toplevel if that bites
+export function inProject(s: Snap, cwd: string) {
+  if (!s.cwd) return s.project === base(cwd)
+  return s.cwd === cwd || s.cwd.startsWith(`${cwd}/`)
+}
+
+// the store keeps every project's plans; the pane, labels and commands see this project's
+async function projectSnap($: EngineInterface) {
+  const cwd = await $.session.cwd()
+  return Object.fromEntries(Object.entries(await getSnap($)).filter(([, s]) => inProject(s, cwd)))
+}
+
 async function publish($: EngineInterface) {
-  const snap = await getSnap($)
+  const snap = await projectSnap($)
   const ov = await getOverrides($)
   const list: Row[] = Object.entries(snap)
     .map(([file, s]) => ({
       file,
       title: s.title,
-      module: `${s.project} · ${s.label ?? '…'}`,
+      module: s.label ?? '…',
       ts: s.ts,
       status: ov[file] ?? s.auto,
       gone: s.gone === true,
@@ -315,7 +329,7 @@ async function labelAll($: EngineInterface) {
   isLabeling = true
   try {
     for (;;) {
-      const snap = await getSnap($)
+      const snap = await projectSnap($)
       const file = Object.keys(snap)
         .filter(f => snap[f]!.labelMtime !== snap[f]!.mtimeMs && !failed.has(f))
         .sort((a, b) => snap[b]!.ts - snap[a]!.ts)[0]
@@ -345,7 +359,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'plans',
-      description: 'Timeline of every plan file Claude wrote, with its status',
+      description: "Timeline of this project's plan files, with their status",
       argumentHint: '[done|pending|cancel|auto <name>]',
     })
     await publish($)
@@ -363,7 +377,7 @@ export const register: Register = on => {
     }
     if (!(verb in VERBS) || !name) return { text: USAGE }
     const status = VERBS[verb]!
-    const snap = await getSnap($)
+    const snap = await projectSnap($)
     const hits = match(snap, name)
     if (hits.length === 0) return { text: `No plan matches "${name}".` }
     if (hits.length > 1) return { text: `"${name}" matches ${hits.length} plans: ${hits.slice(0, 8).join(', ')}` }
@@ -395,16 +409,17 @@ export const register: Register = on => {
     if (list === null) return <Text dimColor>Scanning plans…</Text>
     const count = (s: Status) => list.filter(r => r.status === s).length
     const cols = e.props.bodyColumns
+    const project = base(await $.session.cwd())
     return (
       <Box flexDirection="column">
         <Text bold>
-          {TITLE}{' '}
+          {TITLE} · {project}{' '}
           <Text dimColor>
             {count('done')} done · {count('pending')} pending · {count('cancelled')} cancelled
             {isBusy ? ' · scanning…' : ''}
           </Text>
         </Text>
-        {list.length === 0 && <Text dimColor>No plan files yet.</Text>}
+        {list.length === 0 && <Text dimColor>No plans for this project yet.</Text>}
         {list.length > 0 && (
           <Text mono dimColor>
             {header(cols)}

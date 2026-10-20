@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { derive, formatRow, match, merge, parseLine } from './register'
+import { derive, formatRow, inProject, match, merge, parseLine } from './register'
 import type { Plan } from './register'
 import type { Snap } from '../types'
 
@@ -129,6 +129,16 @@ test('match: exact filename first, then substring of name or title', () => {
   expect(match(snap, 'nope')).toEqual([])
 })
 
+test('inProject: made in the session folder or one inside it', () => {
+  const s = (cwd?: string) => ({ title: 't', project: 'shop', ts: 1, auto: 'done', mtimeMs: 1, ...(cwd ? { cwd } : {}) }) as Snap
+  expect(inProject(s('/work/shop'), '/work/shop')).toBe(true)
+  expect(inProject(s('/work/shop/api'), '/work/shop')).toBe(true)
+  expect(inProject(s('/work/shopfront'), '/work/shop')).toBe(false)
+  expect(inProject(s('/work'), '/work/shop')).toBe(false)
+  // rows stored before cwd was kept fall back to the folder name
+  expect(inProject(s(), '/other/shop')).toBe(true)
+})
+
 const PANE = {
   plugin: 'plan-tracker',
   component: 'Pane',
@@ -148,6 +158,7 @@ const run = (args: string) =>
 
 test('/plans scans, draws status rows, overrides by hand', async ($, on) => {
   mock.store(on)
+  on('session.cwd', () => ({ value: '/work/shop' }))
   let spawned: readonly string[] = []
   on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/u\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('fs.list', () => ({ value: PLANS.map(p => ({ name: p.file, kind: 'file' as const, size: 1, mtimeMs: 5, isLink: false })) }))
@@ -176,9 +187,12 @@ test('/plans scans, draws status rows, overrides by hand', async ($, on) => {
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ text: /5 done · 6 pending · 1 cancelled/ })).toBeDefined()
+    expect(await ui.find({ text: /Plans · shop/ })).toBeDefined()
+    expect(await ui.find({ text: /5 done · 5 pending · 1 cancelled/ })).toBeDefined()
     expect(await ui.find({ text: /^a plan$/ })).toBeDefined()
-    expect(await ui.find({ text: /shop · Login flow/ })).toBeDefined()
+    // h.md was made in /work/notes, another project
+    expect(await ui.find({ text: /^h plan$/ })).toBeUndefined()
+    expect(await ui.find({ text: /Login flow/ })).toBeDefined()
     expect(await ui.find({ text: /\(file gone\)/ })).toBeDefined()
     expect(await ui.find({ text: /● cancelled/ })).toBeDefined()
     await ui.unmount()
@@ -186,10 +200,11 @@ test('/plans scans, draws status rows, overrides by hand', async ($, on) => {
 
   expect((await $.command.run(run('cancel a.md'))).text).toMatch(/a plan: cancelled/)
   expect((await $.command.run(run('done nope'))).text).toMatch(/No plan matches/)
+  expect((await $.command.run(run('done h.md'))).text).toMatch(/No plan matches/)
   expect((await $.command.run(run('wat'))).text).toMatch(/\/plans opens/)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ text: /4 done · 6 pending · 2 cancelled/ })).toBeDefined()
+  expect(await ui.find({ text: /4 done · 5 pending · 2 cancelled/ })).toBeDefined()
   expect((await $.command.run(run('auto a'))).text).toMatch(/a plan: back to done/)
-  expect(await ui.find({ text: /5 done · 6 pending · 1 cancelled/ })).toBeDefined()
+  expect(await ui.find({ text: /5 done · 5 pending · 1 cancelled/ })).toBeDefined()
   await ui.unmount()
 })
