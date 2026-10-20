@@ -23,7 +23,10 @@ const PLAN_PATH = /\/\.claude\/plans\/([^/]+\.md)$/
 
 const LABEL_SYSTEM =
   'You name the module or feature a software plan works on. Reply with 2-4 plain words and nothing else: no project name, punctuation or quotes.'
-const CHECK_SYSTEM = 'You check whether an approved software plan has been carried out. Reply with one word: DONE or PENDING.'
+const CHECK_SYSTEM = 'You check whether a software plan has been carried out. Reply with one word: DONE or PENDING.'
+// a project's own plan folders: plan/ or plans/ at its root, or anywhere under docs/
+const PLAN_DIR = /^plans?$/i
+const SKIP_DIR = /^(\.|node_modules$)/
 
 export type Ev =
   | { k: 'submit'; id: string; file: string; ts: number; cwd: string; session: string; title: string }
@@ -175,10 +178,16 @@ export function pathsOf(md: string, cwd = '') {
   return [...out].slice(0, 40)
 }
 
-// Fresh rows win; stored rows missing from this scan stay, marked gone; labels carry over.
-export function merge(snap: Record<string, Snap>, fresh: Record<string, Snap>) {
+// Checkbox steps in a plan folder file: `- [x]` ticked, `- [ ]` open.
+export function boxes(md: string) {
+  return { ticked: md.match(/^\s*[-*+]\s+\[[xX]\]/gm)?.length ?? 0, open: md.match(/^\s*[-*+]\s+\[ \]/gm)?.length ?? 0 }
+}
+
+// Fresh rows win; stored rows the scan covered but did not find stay, marked gone; labels carry over.
+// A scan covers every Claude plan (keyed by file name) but only the open project's plan folders.
+export function merge(snap: Record<string, Snap>, fresh: Record<string, Snap>, covers = (_key: string) => true) {
   const out: Record<string, Snap> = {}
-  for (const [f, s] of Object.entries(snap)) out[f] = { ...s, gone: true }
+  for (const [f, s] of Object.entries(snap)) out[f] = covers(f) ? { ...s, gone: true } : s
   for (const [f, s] of Object.entries(fresh)) {
     const old = snap[f]
     out[f] = {
@@ -271,7 +280,8 @@ async function publish($: EngineInterface) {
       status: s.auto,
       gone: s.gone === true,
     }))
-    .sort((a, b) => b.ts - a.ts)
+    // same date (one commit added a folder of phases): by name, so 01 comes before 02
+    .sort((a, b) => b.ts - a.ts || a.file.localeCompare(b.file))
   await update($, rows, () => list)
 }
 
@@ -310,7 +320,7 @@ async function scan($: EngineInterface) {
       entries
         .filter(e => e.kind === 'file' && e.name.endsWith('.md') && !e.name.includes('-agent-'))
         .map(async e => {
-          const text = await $.fs.read(`${dir}/${e.name}`).then(t => (typeof t === 'string' ? t : ''), () => '')
+          const text = await readText($, `${dir}/${e.name}`)
           texts.set(e.name, text)
           return { file: e.name, mtimeMs: e.mtimeMs, title: titleOf(text, e.name) }
         }),
@@ -323,7 +333,10 @@ async function scan($: EngineInterface) {
       const s = fresh[file]!
       fresh[file] = await settle($, file, s, check, texts.get(file) ?? '', old[file], inProject(s, cwd))
     }
-    await serial(async () => $.store.set('rows', merge(await getSnap($), fresh)))
+    Object.assign(fresh, await scanFolders($, cwd, old))
+    // ponytail: a project nested inside the session folder has its folder rows marked gone; rare
+    const covers = (key: string) => !key.includes('/') || key.startsWith(`${cwd}/`)
+    await serial(async () => $.store.set('rows', merge(await getSnap($), fresh, covers)))
     await publish($)
   } finally {
     isScanning = false
@@ -332,29 +345,40 @@ async function scan($: EngineInterface) {
   void labelAll($)
 }
 
-const checkFailed = new Set<string>()
+// Commit subjects in the repository at `cwd` since `since`, newest first; none outside git.
+async function gitLog($: EngineInterface, cwd: string | undefined, since: number, args: string[]) {
+  if (!cwd) return []
+  const after = `--since=${new Date(since).toISOString()}`
+  const r = await $.process.run(['git', '-C', cwd, 'log', '--all', after, '--format=%s', ...args]).catch(() => undefined)
+  return r?.exitCode === 0 ? r.stdout.split('\n').filter(Boolean) : []
+}
 
 // An answered plan with no work in its own session: a later commit touching the files it names
-// makes it done. Failing that, feedback goes idle into cancelled, and an approved plan is judged
-// by the model from its text and the commits since, cached until a new commit lands.
-// Only this project's plans reach the model; others keep their last verdict.
+// makes it done. Failing that, feedback goes idle into cancelled, and an approved plan goes to judge().
 async function settle($: EngineInterface, file: string, s: Snap, c: Check, text: string, old: Snap | undefined, mayAsk: boolean, now = Date.now()): Promise<Snap> {
   if (!text) return old ? { ...s, auto: old.auto } : s
-  const log = async (args: string[]) => {
-    if (!s.cwd) return []
-    const since = `--since=${new Date(c.since).toISOString()}`
-    const r = await $.process.run(['git', '-C', s.cwd, 'log', '--all', since, '--format=%s', ...args]).catch(() => undefined)
-    return r?.exitCode === 0 ? r.stdout.split('\n').filter(Boolean) : []
-  }
   const paths = pathsOf(text, s.cwd)
-  if (paths.length && (await log(['--', ...paths])).length) return { ...s, auto: 'done' }
+  if (paths.length && (await gitLog($, s.cwd, c.since, ['--', ...paths])).length) return { ...s, auto: 'done' }
   if (!c.approved) return { ...s, auto: now - c.last > IDLE_MS ? 'cancelled' : 'pending' }
-  const subjects = await log(['-n', '30'])
-  const key = `${c.since}:${subjects.length}:${subjects[0] ?? ''}`
+  return judge($, file, s, text, c.since, old, mayAsk, true)
+}
+
+const checkFailed = new Set<string>()
+
+// The model's done-or-pending verdict from the plan's text and the commits after `since`: those
+// touching files it names, and the first 40 (work tends to follow a plan, and a busy repo's newest
+// commits are about something else). Cached on the row until the plan file changes, a named file
+// is committed, or the first 40 fill up. Only this project's plans reach the model; others keep
+// their last verdict.
+async function judge($: EngineInterface, file: string, s: Snap, text: string, since: number, old: Snap | undefined, mayAsk: boolean, approved: boolean): Promise<Snap> {
+  const paths = pathsOf(text, s.cwd)
+  const touched = paths.length ? await gitLog($, s.cwd, since, ['-n', '40', '--', ...paths]) : []
+  const first = (await gitLog($, s.cwd, since, ['--reverse'])).slice(0, 40)
+  const key = `${since}:${s.mtimeMs}:${touched.length}:${touched[0] ?? ''}:${first.length}`
   const verdict = (done: boolean): Snap => ({ ...s, auto: done ? 'done' : 'pending', checkKey: key, checkDone: done })
   if (old?.checkKey === key && old.checkDone !== undefined) return verdict(old.checkDone)
   if (!mayAsk || checkFailed.has(`${file}:${key}`)) return s
-  const done = await askDone($, text, subjects)
+  const done = await askDone($, text, touched, first, approved)
   if (done === undefined) {
     checkFailed.add(`${file}:${key}`)
     return s
@@ -362,12 +386,72 @@ async function settle($: EngineInterface, file: string, s: Snap, c: Check, text:
   return verdict(done)
 }
 
-async function askDone($: EngineInterface, text: string, subjects: string[]) {
+const ls = ($: EngineInterface, dir: string) => $.fs.list(dir).catch(() => [])
+const readText = ($: EngineInterface, path: string) => $.fs.read(path).then(t => (typeof t === 'string' ? t : ''), () => '')
+
+async function planDirs($: EngineInterface, root: string) {
+  const dirs: string[] = []
+  for (const e of await ls($, root)) if (e.kind === 'dir' && PLAN_DIR.test(e.name)) dirs.push(`${root}/${e.name}`)
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    for (const e of await ls($, dir)) {
+      if (e.kind !== 'dir' || SKIP_DIR.test(e.name)) continue
+      if (PLAN_DIR.test(e.name)) dirs.push(`${dir}/${e.name}`)
+      else if (depth > 0) await walk(`${dir}/${e.name}`, depth - 1)
+    }
+  }
+  await walk(`${root}/docs`, 3)
+  return dirs
+}
+
+async function mdUnder($: EngineInterface, dir: string, depth = 3): Promise<{ path: string; mtimeMs: number }[]> {
+  const out: { path: string; mtimeMs: number }[] = []
+  for (const e of await ls($, dir)) {
+    const path = `${dir}/${e.name}`
+    if (e.kind === 'file' && e.name.endsWith('.md')) out.push({ path, mtimeMs: e.mtimeMs })
+    else if (e.kind === 'dir' && depth > 0 && !SKIP_DIR.test(e.name)) out.push(...(await mdUnder($, path, depth - 1)))
+  }
+  return out
+}
+
+// When a folder plan was written: a YYYY-MM-DD at the start of its name, else the earlier of the
+// commit that added it and its mtime (written today, committed tomorrow; or committed, then edited).
+async function created($: EngineInterface, root: string, path: string, mtimeMs: number) {
+  const [, y, m, d] = /^(\d{4})-(\d{2})-(\d{2})/.exec(base(path)) ?? []
+  if (y) return new Date(Number(y), Number(m) - 1, Number(d)).getTime()
+  const r = await $.process.run(['git', '-C', root, 'log', '--diff-filter=A', '--format=%at', '--', path]).catch(() => undefined)
+  const added = Number(r?.exitCode === 0 ? r.stdout.trim().split('\n').pop() : '') * 1000
+  return added ? Math.min(added, mtimeMs) : mtimeMs
+}
+
+// Every .md in the project's plan folders, keyed by its path. All boxes ticked is done, some
+// ticked is pending, none ticked (or no boxes) goes to judge(). Folder plans never go idle into
+// cancelled: a roadmap's later phases wait their turn.
+async function scanFolders($: EngineInterface, root: string, old: Record<string, Snap>) {
+  const out: Record<string, Snap> = {}
+  const files = (await Promise.all((await planDirs($, root)).map(d => mdUnder($, d)))).flat()
+  for (const { path, mtimeMs } of files) {
+    const text = await readText($, path)
+    const prev = old[path]
+    // the date it was written does not move, so git is asked once
+    const ts = prev && !prev.gone ? prev.ts : await created($, root, path, mtimeMs)
+    const s: Snap = { title: titleOf(text, base(path)), project: base(root), cwd: root, ts, auto: 'pending', mtimeMs }
+    const { ticked, open } = boxes(text)
+    out[path] = ticked ? { ...s, auto: open ? 'pending' : 'done' } : await judge($, path, s, text, ts, prev, true, false)
+  }
+  return out
+}
+
+async function askDone($: EngineInterface, text: string, touched: string[], first: string[], approved: boolean) {
+  const when = approved ? 'approved' : 'written'
+  const note = approved
+    ? 'A plan that only investigates, diagnoses or answers a question, with nothing to change, is DONE once approved.'
+    : 'An overview or reference document with no work of its own is DONE.'
+  const list = (xs: string[]) => xs.join('\n') || '(none)'
   try {
     const reply = await $.model.complete({
       model: MODEL,
       system: CHECK_SYSTEM,
-      prompt: `Plan:\n${text.slice(0, 4000)}\n\nCommits in its repository since it was approved, newest first:\n${subjects.join('\n') || '(none)'}\n\nA plan that only investigates, diagnoses or answers a question, with nothing to change, is DONE once approved. A plan that changes code or files is DONE only when the commits show that work.`,
+      prompt: `Plan:\n${text.slice(0, 4000)}\n\nCommits since it was ${when} that touched files it names, newest first:\n${list(touched)}\n\nThe first commits after it was ${when}, oldest first:\n${list(first)}\n\n${note} A plan that changes code or files is DONE when the commits show its work, even under other words; otherwise PENDING.`,
       maxTokens: 10,
       timeoutMs: 30_000,
     })
@@ -408,7 +492,8 @@ async function labelAll($: EngineInterface) {
         .sort((a, b) => snap[b]!.ts - snap[a]!.ts)[0]
       if (!file) return
       const s = snap[file]!
-      const text = s.gone ? '' : await $.fs.read(`${await plansDir($)}/${file}`).then(t => (typeof t === 'string' ? t : ''), () => '')
+      // folder plans are keyed by their path, Claude's by their name in ~/.claude/plans
+      const text = s.gone ? '' : await readText($, file.includes('/') ? file : `${await plansDir($)}/${file}`)
       const label = await askLabel($, s.title, text)
       if (!label) {
         failed.add(file)

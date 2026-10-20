@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { derive, formatRow, inProject, merge, parseLine, pathsOf } from './register'
+import { boxes, derive, formatRow, inProject, merge, parseLine, pathsOf } from './register'
 import type { Plan } from './register'
 import type { Snap } from '../types'
 
@@ -139,6 +139,15 @@ test('merge: stored rows outlive their files, labels carry over', () => {
   const seen = { 'a.md': { ...snap['a.md']!, auto: 'done' as const, seen: true } }
   expect(merge(seen, { 'a.md': { title: 'A', project: 'p', ts: 2, auto: 'pending', mtimeMs: 5 } })['a.md']?.auto).toBe('done')
   expect(merge(seen, { 'a.md': { title: 'A', project: 'p', ts: 2, auto: 'pending', mtimeMs: 5, seen: true } })['a.md']?.auto).toBe('pending')
+  // another project's folder plans are outside this scan: not marked gone
+  const other = { '/work/blog/plan/x.md': { title: 'X', project: 'blog', cwd: '/work/blog', ts: 1, auto: 'done' as const, mtimeMs: 1 } }
+  expect(merge(other, {}, k => k.startsWith('/work/shop/'))['/work/blog/plan/x.md']?.gone).toBeUndefined()
+  expect(merge(other, {})['/work/blog/plan/x.md']?.gone).toBe(true)
+})
+
+test('boxes: ticked and open checkbox steps', () => {
+  expect(boxes('# P\n- [x] a\n  - [X] b\n* [ ] c\n- not a box\n`- [ ]` in text')).toEqual({ ticked: 2, open: 1 })
+  expect(boxes('# Overview')).toEqual({ ticked: 0, open: 0 })
 })
 
 test('formatRow: fixed columns, cut titles, gone tag', () => {
@@ -189,12 +198,35 @@ test('/plans scans, settles answered plans through git and the model, draws stat
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (e.argv[0] === 'printenv') return out('/home/u\n')
     gitCalls.push([...e.argv])
+    // first added 2026-10-10 00:00 UTC
+    if (e.argv.includes('--diff-filter=A')) return out('1791590400\n')
     // a later commit touched the file plan b names
     if (e.argv.includes(':(literal)src/b.ts')) return out('feat: b\n')
     return out(e.argv.includes('-n') ? 'chore: unrelated\n' : '')
   })
-  on('fs.list', () => ({ value: PLANS.map(p => ({ name: p.file, kind: 'file' as const, size: 1, mtimeMs: 5, isLink: false })) }))
+  const entry = (name: string, kind: 'file' | 'dir' = 'file') => ({ name, kind, size: 1, mtimeMs: 5, isLink: false })
+  const TREE: Record<string, ReturnType<typeof entry>[]> = {
+    '/home/u/.claude/plans': PLANS.map(p => entry(p.file)),
+    '/work/shop': [entry('plan', 'dir'), entry('docs', 'dir'), entry('server', 'dir'), entry('README.md')],
+    '/work/shop/plan': [entry('01-foundation.md'), entry('02-data.md'), entry('00-overview.md'), entry('notes.txt')],
+    '/work/shop/docs': [entry('superpowers', 'dir')],
+    '/work/shop/docs/superpowers': [entry('plans', 'dir')],
+    '/work/shop/docs/superpowers/plans': [entry('2026-09-21-points.md')],
+    // a code folder named plans outside docs/ is not a plan folder
+    '/work/shop/server': [entry('api', 'dir')],
+    '/work/shop/server/api': [entry('plans', 'dir')],
+    '/work/shop/server/api/plans': [entry('route.md')],
+  }
+  on('fs.list', ($, e) => ({ value: TREE[e.path ?? ''] ?? [] }))
+  const FOLDER: Record<string, string> = {
+    '/work/shop/plan/01-foundation.md': '# 01 — Foundation\n- [x] repo\n- [x] deploy',
+    '/work/shop/plan/02-data.md': '# 02 — Data model\n- [x] tables\n- [ ] seed',
+    '/work/shop/plan/00-overview.md': '# 00 — Overview\n\nWhat the site is.',
+    '/work/shop/docs/superpowers/plans/2026-09-21-points.md': '# Points system\n- [ ] ledger\n- [ ] badge',
+  }
   on('fs.read', ($, e) => {
+    const folder = FOLDER[e.path]
+    if (folder) return { value: folder }
     const n = e.path.split('/').pop()!.replace('.md', '')
     return { value: `# Plan: ${n} plan\n\nbody${n === 'b' ? ' Touch `src/b.ts`.' : ''}` }
   })
@@ -210,8 +242,9 @@ test('/plans scans, settles answered plans through git and the model, draws stat
   on('model.complete', ($, e) => {
     const prompt = String(e.prompt)
     if (!String(e.system).includes('carried out')) return { value: { isAnswered: true, text: 'Login flow', usage: USAGE } }
-    asked.push(prompt.match(/# Plan: (\w+) plan/)?.[1] ?? '?')
-    return { value: { isAnswered: true, text: prompt.includes('i plan') ? 'PENDING' : 'DONE', usage: USAGE } }
+    asked.push(prompt.split('\n')[1] ?? '?')
+    const pending = prompt.includes('i plan') || prompt.includes('Overview')
+    return { value: { isAnswered: true, text: pending ? 'PENDING' : 'DONE', usage: USAGE } }
   })
 
   expect((await $.command.run(run)).text).toMatch(/opened/)
@@ -219,14 +252,18 @@ test('/plans scans, settles answered plans through git and the model, draws stat
   expect(spawned[spawned.length - 1]).toBe('/home/u/.claude/projects')
   // git runs in the plan's own folder, from when it was answered
   expect(gitCalls[0]?.slice(0, 5)).toEqual(['git', '-C', '/work/shop', 'log', '--all'])
-  // b settled by git; e is feedback, so it never reaches the model
-  expect(asked.sort()).toEqual(['i', 'j', 'n'])
+  // b settled by git; e is feedback, so it never reaches the model; folder plans with no ticks do
+  expect([...asked].sort()).toEqual(['# 00 — Overview', '# Plan: i plan', '# Plan: j plan', '# Plan: n plan', '# Points system'])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ text: /Plans · shop/ })).toBeDefined()
-    // done: a b c d g j m n z · pending: i · cancelled: e (idle feedback) f k (idle, no answer)
-    expect(await ui.find({ text: /9 done · 1 pending · 3 cancelled/ })).toBeDefined()
+    // done: a b c d g j m n z, 01 (all ticked), points (model) · pending: i, 02 (part ticked), overview (model)
+    // cancelled: e (idle feedback) f k (idle, no answer)
+    expect(await ui.find({ text: /11 done · 3 pending · 3 cancelled/ })).toBeDefined()
+    expect(await ui.find({ text: /^01 — Foundation$/ })).toBeDefined()
+    expect(await ui.find({ text: /^Sep 21/ })).toBeDefined()
+    expect(await ui.find({ text: /route/ })).toBeUndefined()
     expect(await ui.find({ text: /^a plan$/ })).toBeDefined()
     // h.md was made in /work/notes, another project
     expect(await ui.find({ text: /^h plan$/ })).toBeUndefined()
@@ -235,7 +272,7 @@ test('/plans scans, settles answered plans through git and the model, draws stat
     await ui.unmount()
   }
 
-  // verdicts are cached until a new commit lands
+  // verdicts are cached until a new commit lands or the file changes
   await $.command.run(run)
-  expect(asked).toHaveLength(3)
+  expect(asked).toHaveLength(5)
 })

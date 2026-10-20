@@ -99,7 +99,7 @@ Then run `/reload-plugins` in any open session.
 
 ## plan-tracker
 
-Keeps a timeline of the plans Claude writes in plan mode for the project you are working in, in a Claude Code pane. Each row shows when the plan was written, its title, the module or feature it works on, and its status. The whole row takes the status color: green ● done, yellow ○ pending, red ● cancelled.
+Keeps a timeline of the plans for the project you are working in, in a Claude Code pane: the plans Claude writes in plan mode, and the Markdown files in the project's own plan folder. Each row shows when the plan was written, its title, the module or feature it works on, and its status. The whole row takes the status color: green ● done, yellow ○ pending, red ● cancelled.
 
 ```
 Plans · shop 2 done · 1 pending · 1 cancelled
@@ -122,9 +122,18 @@ From a shell: `claude plugin install plan-tracker --marketplace notjaman/general
 
 Run `/plans` to open the pane. There is nothing else to do: every status is worked out automatically.
 
+### Which plans are shown
+
+- **Claude's plan-mode plans** (`~/.claude/plans`) made in this project.
+- **Every `.md` in the project's plan folders:** `plan/` or `plans/` at the project root, or any `plan`/`plans` folder inside `docs/` (such as `docs/superpowers/plans`), with their subfolders. A folder named `plans` elsewhere, like `server/api/plans`, is code and is skipped.
+
+A folder plan's date is a `YYYY-MM-DD` at the start of its name, or else the earlier of the commit that added it and its last change.
+
 ### How status is worked out
 
-Plan files hold no status. The mod reads Claude Code's session transcripts in `~/.claude/projects`, which log every plan Claude submits, your answer to it, and what Claude did after. It goes by your last answer:
+**Folder plans** go by their checkboxes. Every `- [x]` ticked is done; some ticked is pending. With none ticked, or no checkboxes at all, Claude Haiku 5.5 reads the plan with the commits since it was written (those touching files it names, and the first 40 after it) and says done or pending; an overview or reference document counts as done. Folder plans are never cancelled automatically, so a roadmap's later phases wait their turn in yellow.
+
+**Plan-mode plans:** plan files hold no status. The mod reads Claude Code's session transcripts in `~/.claude/projects`, which log every plan Claude submits, your answer to it, and what Claude did after. It goes by your last answer:
 
 | Your last answer | What happened after | Status |
 |---|---|---|
@@ -135,7 +144,7 @@ Plan files hold no status. The mod reads Claude Code's session transcripts in `~
 | Rejected with no comment | | cancelled |
 | Never submitted, or never answered | Nothing for 7 days | cancelled, pending until then |
 
-Work counts only when it came before the next plan was submitted in that session. A commit counts only when it ran as a command and succeeded. Edits to Claude's own files under `~/.claude` don't count. "Files the plan names" are the paths written in backticks in the plan, like `src/app/page.tsx`. The Haiku verdict is cached and asked again only when a new commit lands in the repository; a plan that only investigates or answers a question counts as done once approved.
+Work counts only when it came before the next plan was submitted in that session. A commit counts only when it ran as a command and succeeded. Edits to Claude's own files under `~/.claude` don't count. "Files the plan names" are the paths written in backticks in the plan, like `src/app/page.tsx`. A Haiku verdict is cached and asked again only when the plan file changes or a file it names is committed; a plan that only investigates or answers a question counts as done once approved.
 
 How it behaves:
 
